@@ -1,11 +1,12 @@
 """Bomfim & Lacerda — aplicação local de testes (não publicar na Internet)."""
-import os, sys, sqlite3, secrets, hashlib, hmac, html, mimetypes, urllib.parse, datetime, calendar, threading, time, re, shutil, traceback, subprocess, json, zipfile, csv, io, base64, socket
+import os, sys, sqlite3, secrets, hashlib, hmac, html, mimetypes, urllib.parse, datetime, calendar, threading, time, re, shutil, traceback, subprocess, json, zipfile, csv, io, base64, socket, unicodedata
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
 from email.parser import BytesParser
 from email.policy import default
+from content_seed import CONTENT_SEED
 
 try:
     from zoneinfo import ZoneInfo
@@ -87,6 +88,7 @@ TEAM_DETAILS = [
 ]
 TEAM_AREAS = ('Direito Civil', 'Direito Trabalhista', 'Direito Previdenciário', 'Direito do Consumidor')
 FAQ_CATEGORIES = ('Atendimento e contratação', 'Processos e acompanhamento jurídico', 'Área do cliente', 'Segurança e privacidade')
+CONTENT_CATEGORIES = ('Direito Previdenciário', 'Direito Trabalhista', 'Direito Civil, Família e Sucessões', 'Orientações e Segurança', 'Notícias Institucionais')
 FAQ_SEED = [
     ('Atendimento e contratação', 'Como posso agendar um atendimento?', 'Você pode entrar em contato com nossa equipe pelos canais oficiais disponibilizados no site, pelo WhatsApp ou pelo chat de atendimento.', 1),
     ('Atendimento e contratação', 'Preciso agendar um horário para ser atendido?', 'Recomendamos o agendamento prévio para oferecer um atendimento adequado, organizado e individualizado.', 2),
@@ -161,7 +163,7 @@ def migrate_appointments_nullable(c):
     c.execute('CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status,when_at)')
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 def schema_version():
@@ -225,7 +227,7 @@ CREATE TABLE IF NOT EXISTS appointment_participants(id INTEGER PRIMARY KEY,appoi
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),subject TEXT NOT NULL,body TEXT NOT NULL,response TEXT DEFAULT '',status TEXT DEFAULT 'Pendente',responded_by INTEGER REFERENCES users(id),responded_at TEXT DEFAULT '',last_activity_at TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),filename TEXT NOT NULL,stored TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL,source TEXT NOT NULL,uploaded_by INTEGER REFERENCES users(id),reviewed INTEGER NOT NULL DEFAULT 0,seen_by_client INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'aguardando_analise',analysis_notes TEXT DEFAULT '',reviewed_by INTEGER REFERENCES users(id),reviewed_at TEXT DEFAULT '',deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),sender_id INTEGER REFERENCES users(id),sender_role TEXT NOT NULL,visibility TEXT NOT NULL DEFAULT 'client',reveal_identity INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,read_by_client INTEGER NOT NULL DEFAULT 0,read_by_staff INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,title TEXT NOT NULL,category TEXT NOT NULL,body TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,title TEXT NOT NULL,slug TEXT DEFAULT '',summary TEXT DEFAULT '',category TEXT NOT NULL,body TEXT NOT NULL,cover_image TEXT DEFAULT '',author TEXT DEFAULT '',sources TEXT DEFAULT '',published INTEGER NOT NULL DEFAULT 0,published_at TEXT DEFAULT '',updated_at TEXT DEFAULT '',featured INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS faqs(id INTEGER PRIMARY KEY,question TEXT NOT NULL,answer TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 0,category TEXT DEFAULT 'Geral',sort_order INTEGER NOT NULL DEFAULT 0,updated TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL,message TEXT NOT NULL,ip TEXT DEFAULT '',consent INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'novo',responsible_id INTEGER REFERENCES users(id) ON DELETE SET NULL,updated TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,user_id INTEGER,action TEXT NOT NULL,detail TEXT NOT NULL,ip TEXT DEFAULT '',user_agent TEXT DEFAULT '',entity TEXT DEFAULT '',entity_id INTEGER,client_id INTEGER,case_id INTEGER,before TEXT DEFAULT '',after TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -336,11 +338,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
         ensure_column(c, 'faqs', 'category', "TEXT DEFAULT 'Geral'")
         ensure_column(c, 'faqs', 'sort_order', 'INTEGER NOT NULL DEFAULT 0')
         ensure_column(c, 'faqs', 'updated', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'slug', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'summary', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'cover_image', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'author', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'sources', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'published_at', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'updated_at', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'featured', 'INTEGER NOT NULL DEFAULT 0')
         c.execute("UPDATE faqs SET category='Geral' WHERE category='' OR category IS NULL")
         c.execute("UPDATE faqs SET sort_order=id WHERE sort_order=0")
         if current_version < 21:
             for category, question, answer, order in FAQ_SEED:
                 c.execute("INSERT INTO faqs(question,answer,published,category,sort_order) SELECT ?,?,1,?,? WHERE NOT EXISTS(SELECT 1 FROM faqs WHERE question=?)", (question, answer, category, order, question))
+        if current_version < 22:
+            for row in c.execute("SELECT id,title FROM posts WHERE slug='' OR slug IS NULL").fetchall():
+                c.execute('UPDATE posts SET slug=? WHERE id=?', (post_slug(c, row['title'], row['id']), row['id']))
+            seed_content_posts(c)
         c.execute('CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status,when_at)')
         ensure_column(c, 'cases', 'last_activity_at', "TEXT DEFAULT ''")
@@ -422,7 +436,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
 def cleanup_orphans():
     try:
         with db() as c:
-            stored = {r[0] for r in c.execute("SELECT stored FROM documents UNION SELECT stored FROM internal_documents UNION SELECT stored FROM message_attachments UNION SELECT avatar FROM users WHERE avatar<>'' UNION SELECT cover FROM users WHERE cover<>'' UNION SELECT attachment_stored FROM team_chat_messages WHERE attachment_stored<>''")}
+            stored = {r[0] for r in c.execute("SELECT stored FROM documents UNION SELECT stored FROM internal_documents UNION SELECT stored FROM message_attachments UNION SELECT avatar FROM users WHERE avatar<>'' UNION SELECT cover FROM users WHERE cover<>'' UNION SELECT attachment_stored FROM team_chat_messages WHERE attachment_stored<>'' UNION SELECT cover_image FROM posts WHERE cover_image<>''")}
         cutoff = time.time() - 86400
         for p in UP.iterdir():
             if not p.is_file() or p.name in stored:
@@ -629,6 +643,126 @@ def format_day_label(value):
 
 def format_message_day_separator(value):
     return '<div class="message-day-separator"><span>' + esc(format_day_label(value)) + '</span></div>'
+
+
+def slugify_text(value):
+    normalized = unicodedata.normalize('NFKD', str(value or '')).encode('ascii', 'ignore').decode('ascii').lower()
+    normalized = re.sub(r'[^a-z0-9]+', '-', normalized).strip('-')
+    return normalized[:80] or 'conteudo'
+
+
+def post_slug(c, title, post_id=None):
+    base = slugify_text(title)
+    candidate = base
+    number = 2
+    while c.execute('SELECT 1 FROM posts WHERE slug=? AND id<>?', (candidate, post_id or 0)).fetchone():
+        candidate = base + '-' + str(number)
+        number += 1
+    return candidate
+
+
+def post_state(post):
+    if not post['published']:
+        return 'Rascunho'
+    if post['published_at']:
+        try:
+            scheduled = datetime.datetime.strptime(str(post['published_at'])[:16], '%Y-%m-%d %H:%M')
+            if scheduled > datetime.datetime.now():
+                return 'Agendado'
+        except ValueError:
+            pass
+    return 'Publicado'
+
+
+def post_url(post):
+    return '/conteudos/' + str(post['slug'] or post['id'])
+
+
+def post_excerpt(post):
+    value = str(post['summary'] or '').strip() or str(post['body'] or '').strip()
+    value = re.sub(r'\s+', ' ', value)
+    return value[:220]
+
+
+def post_category_slug(category):
+    mapping = {
+        'Direito Previdenci\u00e1rio': 'previdenciario',
+        'Direito Trabalhista': 'trabalhista',
+        'Direito Civil, Fam\u00edlia e Sucess\u00f5es': 'civil-familia',
+        'Orienta\u00e7\u00f5es e Seguran\u00e7a': 'orientacoes',
+        'Not\u00edcias Institucionais': 'institucional',
+    }
+    return mapping.get(category, slugify_text(category))
+
+
+def render_article_body(body):
+    blocks = re.split(r'\n\s*\n', str(body or '').replace('\r', '').strip())
+    parts = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = [line.rstrip() for line in block.split('\n') if line.strip()]
+        if block.startswith('### '):
+            parts.append('<h3>' + esc(block[4:].strip()) + '</h3>')
+        elif block.startswith('## '):
+            parts.append('<h2>' + esc(block[3:].strip()) + '</h2>')
+        elif lines and all(line.startswith('- ') for line in lines):
+            parts.append('<ul>' + ''.join('<li>' + esc(line[2:].strip()) + '</li>' for line in lines) + '</ul>')
+        else:
+            parts.append('<p>' + '<br>'.join(esc(line) for line in lines) + '</p>')
+    return ''.join(parts)
+
+
+def render_article_sources(sources):
+    lines = [line.strip().lstrip('-').strip() for line in str(sources or '').splitlines() if line.strip()]
+    return '<ul class="article-sources">' + ''.join('<li>' + esc(line) + '</li>' for line in lines) + '</ul>' if lines else ''
+
+
+def post_cover_html(post, large=False):
+    classes = 'content-cover' + (' content-cover-large' if large else '')
+    if post['cover_image']:
+        return '<img class="' + classes + '" src="/conteudo/capa/' + str(post['id']) + '" alt="" loading="lazy" decoding="async">'
+    tone = post_category_slug(post['category'])
+    return '<div class="content-cover-fallback content-tone-' + tone + (' content-cover-large' if large else '') + '"><span>' + esc(post['category']) + '</span></div>'
+
+
+def content_card_html(post):
+    date_value = post['published_at'] or post['created']
+    return ('<article class="content-card">' +
+            '<a class="content-card-cover" href="' + post_url(post) + '">' + post_cover_html(post) + '</a>' +
+            '<div class="content-card-body"><span class="content-category">' + esc(post['category']) + '</span>' +
+            '<h3><a href="' + post_url(post) + '">' + esc(post['title']) + '</a></h3>' +
+            '<p>' + esc(post_excerpt(post)) + '</p>' +
+            '<div class="content-card-foot"><time>' + esc(fmt_when(date_value)) + '</time>' +
+            '<a class="text-link" href="' + post_url(post) + '">Ler conteúdo completo</a></div></div></article>')
+
+
+def article_preview_html(post):
+    post = dict(post)
+    date_value = fmt_when(post.get('published_at')) if post.get('published_at') else format_db_datetime(post.get('created'))
+    updated = format_db_datetime(post.get('updated_at')) if post.get('updated_at') else ''
+    source_html = render_article_sources(post.get('sources'))
+    if not post.get('cover_image'):
+        post['id'] = 0
+    return ('<article class="article-view content-preview"><a class="text-link article-back" href="/admin/conteudos">&larr; Voltar ao painel de conteúdos</a>' +
+            '<p class="eyebrow">PRÉVIA — ' + esc(post.get('category')) + '</p><h1>' + esc(post.get('title')) + '</h1>' +
+            '<p class="article-summary">' + esc(post.get('summary') or post_excerpt(post)) + '</p>' +
+            '<p class="content-meta">' + esc(post.get('author') or 'Bomfim & Lacerda Advocacia') + ' &middot; ' + esc(date_value) + ((' &middot; Atualizado em ' + esc(updated)) if updated else '') + '</p>' +
+            post_cover_html(post, large=True) + '<div class="article-body">' + render_article_body(post.get('body')) + '</div>' +
+            (('<aside class="article-sources-box"><h2>Fontes e referências</h2>' + source_html + '</aside>') if source_html else '') +
+            '<aside class="article-disclaimer"><strong>Prévia administrativa.</strong> Este conteúdo ainda não está publicado no site.</aside></article>')
+
+
+def seed_content_posts(c):
+    for entry in CONTENT_SEED:
+        if c.execute('SELECT 1 FROM posts WHERE title=?', (entry['title'],)).fetchone():
+            continue
+        slug = post_slug(c, entry['title'])
+        c.execute(
+            'INSERT INTO posts(title,slug,summary,category,body,author,sources,published,published_at,updated_at,featured) VALUES(?,?,?,?,?,?,?,0,\'\',CURRENT_TIMESTAMP,?)',
+            (entry['title'], slug, entry.get('summary', ''), entry['category'], entry['body'], entry.get('author', 'Bomfim & Lacerda Advocacia'), entry.get('sources', ''), 1 if entry.get('featured') else 0),
+        )
 
 
 def task_due_from_fields(fields):
@@ -1284,6 +1418,102 @@ def task_due_fields(date_value='', time_value=''):
     )
 
 
+def post_form(post=None, action='/admin/post'):
+    post = dict(post) if post else {}
+    current_category = post.get('category') or CONTENT_CATEGORIES[0]
+    categories = list(CONTENT_CATEGORIES)
+    if current_category not in categories:
+        categories.append(current_category)
+    category_options = ''.join('<option value="' + esc(name) + '"' + (' selected' if name == current_category else '') + '>' + esc(name) + '</option>' for name in categories)
+    published_at = str(post.get('published_at') or '').replace(' ', 'T')[:16]
+    updated_at = str(post.get('updated_at') or '').replace(' ', 'T')[:16]
+    cover_note = '<p class="muted">Capa atual: <a class="text-link" href="/conteudo/capa/' + str(post.get('id')) + '" target="_blank" rel="noopener">visualizar</a></p>' if post.get('cover_image') else '<p class="muted">Nenhuma imagem de capa enviada.</p>'
+    hidden_id = '<input type="hidden" name="post_id" value="' + str(post.get('id')) + '">' if post.get('id') else ''
+    return ('<form method="post" action="' + esc(action) + '" enctype="multipart/form-data" class="content-admin-form">' +
+            '<input type="hidden" name="csrf" value="' + CSRF_PLACEHOLDER + '">' + hidden_id +
+            '<label>Título<input type="text" name="title" value="' + esc(post.get('title') or '') + '" required maxlength="180"></label>' +
+            '<label>Categoria<select name="category" required>' + category_options + '</select></label>' +
+            '<label>Resumo<textarea name="summary" rows="3" maxlength="500">' + esc(post.get('summary') or '') + '</textarea></label>' +
+            '<label>Texto completo<textarea name="body" rows="18" required>' + esc(post.get('body') or '') + '</textarea></label>' +
+            '<div class="content-admin-row"><label>Autor<input type="text" name="author" value="' + esc(post.get('author') or 'Bomfim & Lacerda Advocacia') + '"></label>' +
+            '<label>Data de publicação<input type="datetime-local" name="published_at" value="' + esc(published_at) + '"></label>' +
+            '<label>?ltima atualiza??o<input type="datetime-local" name="updated_at" value="' + esc(updated_at) + '"></label></div>' +
+            '<label>Fontes e referências<textarea name="sources" rows="4" placeholder="Uma fonte por linha">' + esc(post.get('sources') or '') + '</textarea></label>' +
+            '<label>Imagem de capa<input type="file" name="cover" accept="image/png,image/jpeg,image/webp">' + cover_note + '</label>' +
+            '<label class="check"><input type="checkbox" name="featured" value="1"' + (' checked' if post.get('featured') else '') + '> Destacar este conteúdo</label>' +
+            '<div class="content-admin-actions"><button class="btn" type="submit" name="action" value="draft">Salvar rascunho</button><button class="btn dark" type="submit" name="action" value="publish">Publicar</button><button class="btn ghost" type="submit" name="action" value="preview">Visualizar</button><a class="text-link" href="/admin/conteudos">Cancelar</a></div>' +
+            '</form>')
+
+
+def save_post_cover(files, old=''):
+    info = files.get('cover') if files else None
+    if not info:
+        return old
+    filename, payload, _mime = info
+    if not payload:
+        return old
+    allowed = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp'}
+    extension = Path(filename or '').suffix.lower()
+    if extension not in allowed or len(payload) > MAX_FILE:
+        raise ValidationError('Imagem de capa inválida. Envie PNG, JPG ou WEBP de até 10 MB.')
+    signatures = {'.png': payload.startswith(b'\x89PNG\r\n\x1a\n'), '.jpg': payload.startswith(b'\xff\xd8\xff'), '.jpeg': payload.startswith(b'\xff\xd8\xff'), '.webp': payload[:4] == b'RIFF' and payload[8:12] == b'WEBP'}
+    if not signatures[extension]:
+        raise ValidationError('O conteúdo da imagem de capa não corresponde ao formato.')
+    stored = 'conteudo-' + secrets.token_hex(20) + extension
+    temp = UP / (stored + '.tmp')
+    temp.write_bytes(payload)
+    if not scan_file(temp):
+        temp.unlink(missing_ok=True)
+        raise ValidationError('A imagem de capa não passou na verificação de segurança.')
+    os.replace(temp, UP / stored)
+    return stored
+
+
+def post_payload(fields, files, existing=None):
+    existing = dict(existing) if existing else {}
+    title = text_field(fields, 'title', 180, True, 'titulo')
+    category = text_field(fields, 'category', 120, True, 'categoria')
+    legacy_action = 'action' not in fields
+    if category not in CONTENT_CATEGORIES and not legacy_action:
+        raise ValidationError('Escolha uma categoria valida.')
+    summary = text_field(fields, 'summary', 500)
+    body = text_field(fields, 'body', 50000, True, 'texto')
+    author = text_field(fields, 'author', 120) or 'Bomfim & Lacerda Advocacia'
+    sources = text_field(fields, 'sources', 5000)
+    raw_date = str(fields.get('published_at', '') or '').strip()
+    published_at = ''
+    if raw_date:
+        try:
+            published_at = datetime.datetime.strptime(raw_date, '%Y-%m-%dT%H:%M').strftime('%Y-%m-%d %H:%M')
+        except ValueError:
+            raise ValidationError('Data de publicacao invalida.')
+    raw_updated = str(fields.get('updated_at', '') or '').strip()
+    if raw_updated:
+        try:
+            updated_at = datetime.datetime.strptime(raw_updated, '%Y-%m-%dT%H:%M').strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            raise ValidationError('Data de atualiza??o inv?lida.')
+        existing_updated = str(existing.get('updated_at') or '').replace('T', ' ')[:16]
+        if existing_updated and raw_updated[:16] == existing_updated:
+            updated_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        updated_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    action = str(fields.get('action', 'publish' if fields.get('published') == '1' else 'draft'))
+    if action not in ('draft', 'publish', 'preview'):
+        action = 'draft'
+    if action == 'publish' and not published_at:
+        published_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    return {
+        'title': title, 'category': category, 'summary': summary, 'body': body,
+        'author': author, 'sources': sources, 'published_at': published_at,
+        'published': 1 if action == 'publish' else 0,
+        'featured': 1 if fields.get('featured') == '1' else 0,
+        'cover_image': save_post_cover(files, existing.get('cover_image', '')),
+        'updated_at': updated_at,
+        'action': action,
+    }
+
+
 def appointment_when_fields(date_value='', time_value=''):
     return (
         input_field('Data', 'when_date', date_value, 'date', required=True)
@@ -1701,7 +1931,7 @@ class Handler(BaseHTTPRequestHandler):
         bell = self.notif_bell()
         nav = self.panel_nav(user)
         chat_alert = '<div class="staff-chat-alert" id="staff-chat-alert" data-chat-alert-endpoint="/admin/chats/alertas"><a class="staff-chat-bubble" id="staff-chat-bubble" href="/admin/chats" aria-label="Abrir chat da equipe" title="Chat da equipe"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg><span class="staff-chat-badge" id="staff-chat-badge" hidden>0</span></a><div class="staff-chat-toast" id="staff-chat-toast" hidden><button type="button" class="staff-chat-toast-close" id="staff-chat-toast-close" aria-label="Fechar aviso">×</button><p class="staff-chat-toast-meta">Nova mensagem no chat</p><strong id="staff-chat-toast-name"></strong><p id="staff-chat-toast-body"></p><a id="staff-chat-toast-link" href="/admin/chats">Abrir atendimento →</a></div></div>'
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115o"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115o" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115p"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115p" defer></script></body></html>'''
 
     def chat_widget(self, user, csrf_token):
         with db() as c:
@@ -1719,7 +1949,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def layout(self, title, content, user=None, description=None, csrf_token=''):
         desc = description or (str(title) + ' — Bomfim & Lacerda Advocacia. 40 anos de tradição jurídica, ética e atendimento próximo.')
-        nav = '<a href="/">Início</a><a href="/escritorio">O escritório</a><a href="/equipe">Equipe</a><a href="/areas">Áreas</a><a href="/conteudos">Conteúdo</a><a href="/faq">Dúvidas</a><a href="/contato">Contato</a>'
+        nav = '<a href="/">Início</a><a href="/escritorio">O escritório</a><a href="/equipe">Equipe</a><a href="/areas">Áreas</a><a href="/conteudos">Conteúdos</a><a href="/faq">Dúvidas</a><a href="/contato">Contato</a>'
         bell = ''
         if user:
             panel = 'advogado' if user['role'] == 'staff' else ('admin' if user['role'] == 'admin' else 'cliente')
@@ -1728,7 +1958,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             nav += '<a class="nav-login" href="/entrar">Área do cliente</a>'
         widget = self.chat_widget(user, csrf_token) if not user or user['role'] == 'client' else ''
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115o"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115o" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115p"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115p" defer></script></body></html>'''
 
     def client_layout(self, title, content, user=None, description=None, csrf_token=''):
         desc = description or (str(title) + ' — Meu Espaço — Bomfim & Lacerda Advocacia.')
@@ -1748,7 +1978,7 @@ class Handler(BaseHTTPRequestHandler):
             nav.append('<a href="' + href + '"' + (' class="active" aria-current="page"' if active else '') + '>' + panel_icon(icon) + '<span>' + esc(label) + '</span>' + badge + '</a>')
         nav = ''.join(nav)
         widget = self.chat_widget(user, csrf_token)
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115o"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115o" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115p"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115p" defer></script></body></html>'''
 
     def page(self, title, content, user=None, status=200, description=None):
         data = self.session()
@@ -2364,10 +2594,86 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/areas':
             return self.page('Áreas de atuação', '<section class="wrap section"><p class="eyebrow">COMO PODEMOS ORIENTAR</p><h1>Áreas de atuação</h1><p>Conheça as áreas apresentadas nos materiais institucionais do escritório. Cada situação exige análise individual.</p><div class="cards">' + ''.join(card(a, '<p>' + esc(d) + '</p>') for a, d in AREAS) + '</div></section>', user)
         if path == '/conteudos':
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            category_filter = query.get('categoria', [''])[0].strip()
+            term = query.get('q', [''])[0].strip()[:120]
+            if category_filter not in CONTENT_CATEGORIES:
+                category_filter = ''
+            now_key = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
             with db() as c:
-                posts = c.execute('SELECT * FROM posts WHERE published=1 ORDER BY created DESC').fetchall()
-            body = ''.join(card(p['title'], f'<p class="muted">{esc(p["category"])} · {esc(p["created"][:10])}</p><p>{esc(p["body"])}</p>') for p in posts) or '<p>Ainda não há publicações. Os conteúdos serão disponibilizados após revisão e publicação pela equipe.</p>'
-            return self.page('Conteúdo jurídico', '<section class="wrap section"><h1>Conteúdo jurídico</h1><p>Informações educativas e orientações gerais. Cada caso exige avaliação individual.</p><div class="cards">' + body + '</div></section>', user)
+                sql = "SELECT * FROM posts WHERE published=1 AND (published_at='' OR published_at<=?)"
+                params = [now_key]
+                if category_filter:
+                    sql += ' AND category=?'
+                    params.append(category_filter)
+                if term:
+                    sql += ' AND (LOWER(title) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(body) LIKE ? OR LOWER(category) LIKE ?)'
+                    needle = '%' + term.lower() + '%'
+                    params.extend([needle, needle, needle, needle])
+                posts = c.execute(sql + " ORDER BY COALESCE(NULLIF(published_at,''),created) DESC,id DESC", tuple(params)).fetchall()
+                category_counts = {category: 0 for category in CONTENT_CATEGORIES}
+                for row in c.execute("SELECT category,COUNT(*) AS total FROM posts WHERE published=1 AND (published_at='' OR published_at<=?) GROUP BY category", (now_key,)).fetchall():
+                    if row['category'] in category_counts:
+                        category_counts[row['category']] = row['total']
+            category_links = '<a class="content-chip' + (' active' if not category_filter else '') + '" href="/conteudos">Todos</a>' + ''.join(
+                '<a class="content-chip' + (' active' if category_filter == category else '') + '" href="/conteudos?categoria=' + urllib.parse.quote(category) + '">' + esc(category) + ' <small>' + str(category_counts.get(category, 0)) + '</small></a>'
+                for category in CONTENT_CATEGORIES
+            )
+            filters = '<form class="content-search" method="get" action="/conteudos"><label>Buscar conteúdo<input type="search" name="q" value="' + esc(term) + '" placeholder="Palavra-chave, tema ou dúvida"></label>' + ('<input type="hidden" name="categoria" value="' + esc(category_filter) + '">' if category_filter else '') + '<button class="btn" type="submit">Buscar</button></form>'
+            if posts:
+                show_featured = not category_filter and not term
+                featured = next((post for post in posts if post['featured']), posts[0]) if show_featured else None
+                featured_html = ''
+                if featured:
+                    featured_date = fmt_when(featured['published_at']) if featured['published_at'] else format_db_datetime(featured['created'])
+                    featured_html = '<article class="content-featured">' + '<a class="content-featured-cover" href="' + post_url(featured) + '">' + post_cover_html(featured, large=True) + '</a><div class="content-featured-copy"><span class="content-category">' + esc(featured['category']) + '</span><h2><a href="' + post_url(featured) + '">' + esc(featured['title']) + '</a></h2><p>' + esc(post_excerpt(featured)) + '</p><p class="content-meta">' + esc(featured['author'] or 'Bomfim & Lacerda Advocacia') + ' &middot; ' + esc(featured_date) + ' &middot; ' + str(max(2, (len(str(featured['body']).split()) + 219) // 220)) + ' min de leitura</p><a class="btn" href="' + post_url(featured) + '">Ler conteúdo completo</a></div></article>'
+                grid_posts = [post for post in posts if not featured or post['id'] != featured['id']]
+                grid_html = ''.join(content_card_html(post) for post in grid_posts)
+                empty_html = '' if grid_posts else '<p class="muted">Mais conteúdos serão publicados em breve.</p>'
+                body = featured_html + '<div class="content-grid">' + grid_html + empty_html + '</div>'
+            else:
+                body = '<div class="content-empty"><p class="eyebrow">CONTEÚDOS EM PREPARAÇÃO</p><h2>Estamos preparando este espaço.</h2><p>Os artigos são revisados pela equipe antes da publicação. Enquanto isso, você pode falar com o escritório pelos canais oficiais.</p><a class="btn" href="/contato">Falar com o escritório</a></div>'
+            safety = '<aside class="content-safety"><strong>Segurança em primeiro lugar</strong><p>Antes de efetuar qualquer pagamento ou compartilhar dados, confirme a solicitação diretamente pelos canais oficiais do escritório.</p><a class="text-link" href="/contato">Confirmar canais oficiais &rarr;</a></aside>'
+            intro = '<section class="content-hero"><div class="wrap"><p class="eyebrow">CONTEÚDOS</p><h1>Conhecimento que aproxima.</h1><p class="content-subtitle">A informação é o primeiro passo para compreender seus direitos. Neste espaço, compartilhamos orientações jurídicas, esclarecimentos e informações relevantes para o seu dia a dia.</p></div></section>'
+            content = intro + '<section class="wrap content-section">' + filters + '<nav class="content-categories" aria-label="Categorias de conteúdos">' + category_links + '</nav>' + safety + body + '</section>'
+            return self.page('Conteúdos', content, user)
+        if re.fullmatch(r'/conteudos/[A-Za-z0-9-]+', path):
+            slug = path.rsplit('/', 1)[-1]
+            now_key = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+            with db() as c:
+                post = c.execute("SELECT * FROM posts WHERE (slug=? OR CAST(id AS TEXT)=?) AND published=1 AND (published_at='' OR published_at<=?)", (slug, slug, now_key)).fetchone()
+                if not post:
+                    return self.send('Conteúdo não encontrado', 404)
+                related = c.execute("SELECT * FROM posts WHERE published=1 AND id<>? AND (published_at='' OR published_at<=?) AND category=? ORDER BY COALESCE(NULLIF(published_at,''),created) DESC,id DESC LIMIT 3", (post['id'], now_key, post['category'])).fetchall()
+                if len(related) < 3:
+                    extra = c.execute("SELECT * FROM posts WHERE published=1 AND id<>? AND (published_at='' OR published_at<=?) ORDER BY COALESCE(NULLIF(published_at,''),created) DESC,id DESC LIMIT 6", (post['id'], now_key)).fetchall()
+                    known = {row['id'] for row in related}
+                    related.extend(row for row in extra if row['id'] not in known and len(related) < 3)
+            date_value = fmt_when(post['published_at']) if post['published_at'] else format_db_datetime(post['created'])
+            updated = format_db_datetime(post['updated_at']) if post['updated_at'] else ''
+            source_html = render_article_sources(post['sources'])
+            related_html = ''.join(content_card_html(row) for row in related) or '<p class="muted">Outros conteúdos serão publicados em breve.</p>'
+            article = ('<article class="article-view"><a class="text-link article-back" href="/conteudos">&larr; Voltar aos conteúdos</a>' +
+                       '<p class="eyebrow">' + esc(post['category']) + '</p><h1>' + esc(post['title']) + '</h1>' +
+                       '<p class="article-summary">' + esc(post['summary'] or post_excerpt(post)) + '</p>' +
+                       '<p class="content-meta">' + esc(post['author'] or 'Bomfim & Lacerda Advocacia') + ' &middot; ' + esc(date_value) + ' &middot; ' + str(max(2, (len(str(post['body']).split()) + 219) // 220)) + ' min de leitura' + ((' &middot; Atualizado em ' + esc(updated)) if updated else '') + '</p>' +
+                       post_cover_html(post, large=True) + '<div class="article-body">' + render_article_body(post['body']) + '</div>' +
+                       (('<aside class="article-sources-box"><h2>Fontes e referências</h2>' + source_html + '</aside>') if source_html else '') +
+                       '<aside class="article-disclaimer"><strong>Conteúdo informativo.</strong> Este artigo não substitui a análise individual do seu caso e não representa promessa de resultado. Consulte um profissional de confiança.</aside>' +
+                       '<div class="article-actions"><a class="btn dark" href="/contato">Falar com o escritório</a><a class="text-link" href="/conteudos">Ver todos os conteúdos</a></div></article>')
+            content = '<section class="wrap content-article-section">' + article + '<section class="content-related"><h2>Conteúdos relacionados</h2><div class="content-grid">' + related_html + '</div></section></section>'
+            return self.page(post['title'] + ' | Conteúdos', content, user)
+        if re.fullmatch(r'/conteudo/capa/\d+', path):
+            post_id = int(path.rsplit('/', 1)[-1])
+            with db() as c:
+                post = c.execute('SELECT cover_image FROM posts WHERE id=?', (post_id,)).fetchone()
+            if not post or not post['cover_image']:
+                return self.send('Imagem n?o encontrada', 404)
+            target = UP / post['cover_image']
+            if not target.is_file():
+                return self.send('Imagem n?o encontrada', 404)
+            ctype = mimetypes.guess_type(str(target))[0] or 'application/octet-stream'
+            return self.send_file(target, ctype, cache='public, max-age=86400')
         if path == '/faq':
             with db() as c:
                 faqs = c.execute("SELECT * FROM faqs WHERE published=1 ORDER BY sort_order,id").fetchall()
@@ -3798,12 +4104,68 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/admin/conteudos':
             if not user or user['role'] not in ('admin', 'staff'):
                 return self.forbidden()
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            term = query.get('q', [''])[0].strip()[:150]
+            category_filter = query.get('categoria', [''])[0].strip()
+            state_filter = query.get('status', [''])[0].strip()
+            if category_filter not in CONTENT_CATEGORIES:
+                category_filter = ''
             with db() as c:
                 posts = c.execute('SELECT * FROM posts ORDER BY id DESC').fetchall()
-            create_form = form('/admin/post', field('Título', 'title') + field('Categoria', 'category') + '<label>Texto<textarea name="body" required></textarea></label><label class="check"><input type="checkbox" name="published" value="1"> Publicar no site</label>', 'Salvar conteúdo')
-            items = ''.join('<li>' + esc(post['title']) + ' — ' + ('Publicado' if post['published'] else 'Rascunho') + ' — ' + esc(format_db_datetime(post['created'])) + '</li>' for post in posts) or '<li>Nenhum conteúdo.</li>'
-            content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Conteúdos jurídicos</h1>' + card('Novo conteúdo', create_form) + card('Publicações', '<ul class="publication-list">' + items + '</ul>') + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
-            return self.page('Conteúdos jurídicos', content, user)
+            if term:
+                needle = term.casefold()
+                posts = [post for post in posts if needle in ' '.join(str(post[key] or '') for key in ('title', 'summary', 'category', 'author')).casefold()]
+            if category_filter:
+                posts = [post for post in posts if post['category'] == category_filter]
+            if state_filter == 'rascunho':
+                posts = [post for post in posts if not post['published']]
+            elif state_filter == 'publicado':
+                posts = [post for post in posts if post_state(post) == 'Publicado']
+            elif state_filter == 'agendado':
+                posts = [post for post in posts if post_state(post) == 'Agendado']
+            elif state_filter == 'destaque':
+                posts = [post for post in posts if post['featured']]
+            category_options = '<option value="">Todas as categorias</option>' + ''.join('<option value="' + esc(cat) + '"' + (' selected' if category_filter == cat else '') + '>' + esc(cat) + '</option>' for cat in CONTENT_CATEGORIES)
+            state_options = ''.join('<option value="' + value + '"' + (' selected' if state_filter == value else '') + '>' + label + '</option>' for value, label in (('', 'Todos os estados'), ('rascunho', 'Rascunhos'), ('publicado', 'Publicados'), ('agendado', 'Agendados'), ('destaque', 'Em destaque')))
+            filters = '<form class="admin-filters content-admin-filters" method="get" action="/admin/conteudos"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Título, resumo, categoria ou autor"></label><label>Categoria<select name="categoria">' + category_options + '</select></label><label>Estado<select name="status">' + state_options + '</select></label><button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/conteudos">Limpar</a></form>'
+            items = []
+            for post in posts:
+                state = post_state(post)
+                tone = 'green' if state == 'Publicado' else 'yellow' if state == 'Agendado' else 'gray'
+                date_value = fmt_when(post['published_at']) if post['published_at'] else '—'
+                updated_value = format_db_datetime(post['updated_at']) if post['updated_at'] else '—'
+                preview_link = '<a class="text-link" href="/admin/conteudos/visualizar?id=' + str(post['id']) + '">Visualizar</a>'
+                edit_link = '<a class="text-link" href="/admin/conteudos/editar?id=' + str(post['id']) + '">Editar</a>'
+                publish_action = 'despublicar' if post['published'] else 'publicar'
+                publish_label = 'Despublicar' if post['published'] else 'Publicar'
+                publish_form = form('/admin/conteudos/status', '<input type="hidden" name="post_id" value="' + str(post['id']) + '"><input type="hidden" name="operation" value="' + publish_action + '">', publish_label)
+                feature_form = form('/admin/conteudos/destaque', '<input type="hidden" name="post_id" value="' + str(post['id']) + '">', 'Remover destaque' if post['featured'] else 'Destacar')
+                delete_form = form('/admin/conteudos/excluir', '<input type="hidden" name="post_id" value="' + str(post['id']) + '">', 'Excluir')
+                items.append('<article class="content-admin-item"><div class="content-admin-item-head"><div><span class="content-category">' + esc(post['category']) + '</span><h3>' + esc(post['title']) + '</h3></div><span class="status-badge status-' + tone + '">' + state + '</span></div><p>' + esc(post_excerpt(post)) + '</p><p class="content-admin-meta">Publicação: ' + esc(date_value) + ' &middot; Atualização: ' + esc(updated_value) + ' &middot; Autor: ' + esc(post['author'] or '—') + (' &middot; <strong>Em destaque</strong>' if post['featured'] else '') + '</p><div class="content-admin-links">' + preview_link + edit_link + '</div><div class="content-admin-row">' + publish_form + feature_form + delete_form + '</div></article>')
+            create = '<details class="conversation-new content-admin-create"><summary>Novo conteúdo</summary>' + post_form() + '</details>'
+            content = '<section class="wrap section admin-workspace"><div class="content-admin-head"><div><p class="eyebrow">GESTÃO DO SITE</p><h1>Conteúdos</h1><p class="muted">Crie, revise, destaque e agende artigos. Publicações futuras ficam agendadas até a data escolhida.</p></div><a class="btn ghost" href="/conteudos" target="_blank" rel="noopener">Ver página pública</a></div>' + create + filters + '<p class="muted">' + str(len(posts)) + ' conteúdo(s) encontrado(s).</p><div class="content-admin-list">' + (''.join(items) or '<p class="muted">Nenhum conteúdo encontrado.</p>') + '</div></section>'
+            return self.page('Conteúdos', content, user)
+        if path == '/admin/conteudos/editar':
+            if not user or user['role'] not in ('admin', 'staff'):
+                return self.forbidden()
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            post_id = to_int({'post_id': query.get('id', ['0'])[0]}, 'post_id')
+            with db() as c:
+                post = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+            if not post:
+                return self.forbidden()
+            content = '<section class="wrap section admin-workspace"><a class="text-link" href="/admin/conteudos">&larr; Voltar aos conteúdos</a><p class="eyebrow">EDITAR CONTEÚDO</p><h1>' + esc(post['title']) + '</h1><p class="muted">Status atual: ' + post_state(post) + '. Salve como rascunho, agende com uma data futura ou publique.</p><div class="content-admin-edit">' + post_form(post, action='/admin/conteudos/editar') + '</div><p><a class="text-link" href="/admin/conteudos/visualizar?id=' + str(post['id']) + '">Abrir prévia</a></p></section>'
+            return self.page('Editar conteúdo', content, user)
+        if path == '/admin/conteudos/visualizar':
+            if not user or user['role'] not in ('admin', 'staff'):
+                return self.forbidden()
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            post_id = to_int({'post_id': query.get('id', ['0'])[0]}, 'post_id')
+            with db() as c:
+                post = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+            if not post:
+                return self.forbidden()
+            return self.page('Prévia do conteúdo', '<section class="wrap content-article-section">' + article_preview_html(post) + '</section>', user)
         if path == '/admin/faq':
             if not user or user['role'] not in ('admin', 'staff'):
                 return self.forbidden()
@@ -5460,12 +5822,73 @@ class Handler(BaseHTTPRequestHandler):
                     notify(c, request_row['client_id'], 'request', 'Resposta recebida', response[:200], '/cliente', request_row['client_id'], request_row['case_id'], 'request-' + str(request_id) + '-response-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S'))
                     self.audit_action(c, user['id'], 'responder solicitação', str(request_id), entity='request', entity_id=request_id, client_id=request_row['client_id'], case_id=request_row['case_id'], before={'response': request_row['response'], 'status': request_row['status']}, after={'response': response, 'status': status, 'responded_by': user['id']})
                     redirect_to = '/admin/solicitacoes'
-                elif path == '/admin/post':
-                    title = text_field(fields, 'title', 150, True, 'título')
-                    category = text_field(fields, 'category', 80, True, 'categoria')
-                    body = text_field(fields, 'body', 10000, True, 'texto')
-                    cursor = c.execute('INSERT INTO posts(title,category,body,published) VALUES(?,?,?,?)', (title, category, body, bool_flag(fields, 'published')))
-                    self.audit_action(c, user['id'], 'criar conteúdo', title, entity='post', entity_id=cursor.lastrowid, after={'title': title, 'category': category})
+                elif path == '/admin/post' or path == '/admin/conteudos/editar':
+                    if not user or user['role'] not in ('admin', 'staff'):
+                        return self.forbidden()
+                    post_id = 0
+                    existing = None
+                    if path == '/admin/conteudos/editar':
+                        post_id = to_int(fields, 'post_id')
+                        with db() as c:
+                            existing = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+                        if not existing:
+                            raise ValidationError('Conteúdo não encontrado.')
+                    payload = post_payload(fields, files, existing)
+                    if payload['action'] == 'preview':
+                        preview = dict(payload)
+                        preview.update({'id': post_id, 'slug': 'previa', 'created': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'updated_at': payload['published_at'], 'cover_image': ''})
+                        return self.page('Prévia do conteúdo', '<section class="wrap content-article-section">' + article_preview_html(preview) + '</section>', user)
+                    with db() as c:
+                        if path == '/admin/post':
+                            slug = post_slug(c, payload['title'])
+                            cursor = c.execute('INSERT INTO posts(title,slug,summary,category,body,cover_image,author,sources,published,published_at,updated_at,featured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured']))
+                            self.audit_action(c, user['id'], 'criar conteúdo', payload['title'], entity='post', entity_id=cursor.lastrowid, after={'title': payload['title'], 'category': payload['category'], 'published': payload['published'], 'published_at': payload['published_at'], 'featured': payload['featured']})
+                        else:
+                            slug = post_slug(c, payload['title'], post_id)
+                            c.execute('UPDATE posts SET title=?,slug=?,summary=?,category=?,body=?,cover_image=?,author=?,sources=?,published=?,published_at=?,updated_at=?,featured=? WHERE id=?', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured'], post_id))
+                            self.audit_action(c, user['id'], 'editar conteúdo', payload['title'], entity='post', entity_id=post_id, before={'title': existing['title'], 'category': existing['category'], 'published': existing['published'], 'published_at': existing['published_at'], 'featured': existing['featured']}, after={'title': payload['title'], 'category': payload['category'], 'published': payload['published'], 'published_at': payload['published_at'], 'featured': payload['featured']})
+                    redirect_to = '/admin/conteudos'
+                elif path == '/admin/conteudos/status':
+                    if not user or user['role'] not in ('admin', 'staff'):
+                        return self.forbidden()
+                    post_id = to_int(fields, 'post_id')
+                    operation = str(fields.get('operation', ''))
+                    with db() as c:
+                        post = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+                        if not post:
+                            raise ValidationError('Conteúdo não encontrado.')
+                        if operation == 'despublicar':
+                            c.execute("UPDATE posts SET published=0,updated_at=CURRENT_TIMESTAMP WHERE id=?", (post_id,))
+                            action_label = 'despublicar conteúdo'
+                        elif operation == 'publicar':
+                            published_at = post['published_at'] or datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+                            c.execute("UPDATE posts SET published=1,published_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (published_at, post_id))
+                            action_label = 'publicar conteúdo'
+                        else:
+                            raise ValidationError('Operação inválida.')
+                        self.audit_action(c, user['id'], action_label, post['title'], entity='post', entity_id=post_id, before={'published': post['published'], 'published_at': post['published_at']}, after={'published': 1 if operation == 'publicar' else 0})
+                    redirect_to = '/admin/conteudos'
+                elif path == '/admin/conteudos/destaque':
+                    if not user or user['role'] not in ('admin', 'staff'):
+                        return self.forbidden()
+                    post_id = to_int(fields, 'post_id')
+                    with db() as c:
+                        post = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+                        if not post:
+                            raise ValidationError('Conteúdo não encontrado.')
+                        c.execute('UPDATE posts SET featured=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', (0 if post['featured'] else 1, post_id))
+                        self.audit_action(c, user['id'], 'alterar destaque do conteúdo', post['title'], entity='post', entity_id=post_id, before={'featured': post['featured']}, after={'featured': 0 if post['featured'] else 1})
+                    redirect_to = '/admin/conteudos'
+                elif path == '/admin/conteudos/excluir':
+                    if not user or user['role'] not in ('admin', 'staff'):
+                        return self.forbidden()
+                    post_id = to_int(fields, 'post_id')
+                    with db() as c:
+                        post = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+                        if not post:
+                            raise ValidationError('Conteúdo não encontrado.')
+                        c.execute('DELETE FROM posts WHERE id=?', (post_id,))
+                        self.audit_action(c, user['id'], 'excluir conteúdo', post['title'], entity='post', entity_id=post_id, before={'title': post['title'], 'category': post['category']})
                     redirect_to = '/admin/conteudos'
                 elif path == '/admin/faq':
                     category = str(fields.get('category', 'Geral')).strip()[:120] or 'Geral'

@@ -1113,3 +1113,9 @@ document.querySelectorAll('[data-calendar-date]').forEach((cell) => {
     window.location.href = '/admin/compromissos?novo=1&data=' + encodeURIComponent(cell.dataset.calendarDate);
   });
 });
+
+document.querySelectorAll('form[action="/admin/conteudos/excluir"]').forEach((form) => {
+  form.addEventListener('submit', (event) => {
+    if (!window.confirm('Excluir definitivamente este conte?do?')) event.preventDefault();
+  });
+});
