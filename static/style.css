@@ -1214,3 +1214,44 @@ input[type=file]::file-selector-button:hover{background:#ffd166}
 .cards .panel{border-top:4px solid #f0b94d;background:linear-gradient(180deg,#fff 0%,#fff8e8 100%);box-shadow:0 10px 28px #061d3214}
 .cards .panel h3{color:#08263b}
 .cards .panel p{color:#3f5366}
+
+/* Ficha do cliente: informa??es abaixo do nome e resumo anal?tico */
+.client-profile-meta{margin:-2px 0 9px;color:#526170;font-size:12.5px;font-weight:700}
+.client-profile-top{margin:0 0 11px}
+.client-profile-top .panel{border-left:5px solid #c99a47;background:#fffdf7;padding:13px 15px;box-shadow:0 5px 16px #061d320c}
+.client-profile-top .panel h3{font-size:16px;margin:0 0 7px}
+.client-info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:5px 7px;margin-bottom:5px}
+.client-info-grid>div{display:flex;flex-direction:column;gap:0;padding:6px 8px;background:#fff;border:1px solid #ece5d9;border-radius:6px;min-width:0}
+.client-info-label{font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:#8a5a00;line-height:1.25}
+.client-info-grid strong{font-size:12.5px;color:#0b2941;overflow-wrap:anywhere;font-weight:700;line-height:1.35}
+.client-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:5px;margin:0 0 12px}
+.client-metric{display:flex;flex-direction:column;gap:0;padding:8px 9px;border:1px solid #dce6ee;border-radius:7px;background:#fff;box-shadow:0 3px 10px #061d3206;color:#0b2941}
+.client-metric strong{font:700 1.18rem Georgia,serif;line-height:1.05;color:#0b3f63}
+.client-metric span{font-size:9px;font-weight:800;letter-spacing:.035em;text-transform:uppercase;color:#526170;line-height:1.25}
+.client-metric:hover{border-color:#c99a47;background:#fffdf7;box-shadow:0 5px 14px #061d3210}
+@media(max-width:700px){.client-info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.client-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:430px){.client-info-grid,.client-metrics{grid-template-columns:1fr}}
+
+.client-profile-page .dashboard{gap:14px}
+.client-profile-page .dashboard .panel{padding:16px 18px}
+.client-profile-page .dashboard .panel h3{font-size:1.08rem;margin:.25em 0 .55em}
+.client-profile-page .dashboard .panel p{margin-bottom:.7rem}
+
+/* Ficha do cliente em linhas compactas, sem cart?es */
+.client-profile-top{margin:0 0 8px}
+.client-profile-info{padding:0;margin:0}
+.client-profile-info h2{font-size:15px;margin:0 0 5px;color:#0b2941}
+.client-info-line{display:flex;align-items:baseline;gap:7px;margin:2px 0!important;font-size:13px;line-height:1.45;color:#1d3448}
+.client-info-label{min-width:145px;color:#8a5a00;font-size:11.5px;font-weight:800;text-transform:uppercase;letter-spacing:.03em}
+.client-info-line strong{font-size:13px;font-weight:650;color:#142333;overflow-wrap:anywhere}
+.client-info-line a{font-size:13px}
+.client-metrics{display:flex!important;flex-wrap:wrap;align-items:center;gap:4px 16px!important;margin:4px 0 10px!important;padding:6px 0;border-top:1px solid #eee7db;border-bottom:1px solid #eee7db;grid-template-columns:none!important}
+.client-metric{display:inline-flex!important;flex-direction:row!important;align-items:baseline;gap:4px!important;padding:0!important;border:0!important;background:none!important;box-shadow:none!important;border-radius:0!important;color:#526170!important;font-size:11.5px!important;white-space:nowrap}
+.client-metric strong{font:800 13px 'Segoe UI',Arial,sans-serif!important;color:#0b3f63!important;line-height:1!important}
+.client-metric span{font-size:11px!important;font-weight:700!important;text-transform:none!important;letter-spacing:0!important;color:#526170!important}
+.client-metric:hover{background:none!important;border:0!important;box-shadow:none!important;color:#805912!important}
+@media(max-width:600px){.client-info-line{display:block}.client-info-label{display:block;min-width:0;margin-bottom:1px}}
+
+.story-closing{margin-top:22px;padding-top:16px;border-top:1px solid #e8e2d7;color:#253b4c}
+.story-closing p{margin:0 0 8px}
+.story-closing p:last-child{font:400 clamp(1.08rem,1.8vw,1.3rem)/1.5 Georgia,serif;color:#0b2941;margin-bottom:0}
