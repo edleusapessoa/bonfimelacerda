@@ -1255,3 +1255,13 @@ input[type=file]::file-selector-button:hover{background:#ffd166}
 .story-closing{margin-top:22px;padding-top:16px;border-top:1px solid #e8e2d7;color:#253b4c}
 .story-closing p{margin:0 0 8px}
 .story-closing p:last-child{font:400 clamp(1.08rem,1.8vw,1.3rem)/1.5 Georgia,serif;color:#0b2941;margin-bottom:0}
+
+/* Hor?rios e agrupamento por dia no padr?o de conversa */
+.message-day-separator{display:flex;justify-content:center;width:100%;margin:6px 0 2px}
+.message-day-separator span{background:#e5ebf0;color:#526170;border-radius:20px;padding:3px 10px;font-size:10.5px;font-weight:800;letter-spacing:.02em}
+.message .message-time{display:block;text-align:right;font-size:9.5px;line-height:1.2;margin-top:2px;color:#6f7f8c;white-space:nowrap}
+.message.client .message-time{color:#c8d8e5}
+.message.office:not(.internal) .message-time{color:#cfe3f1}
+.message.internal .message-time{color:#7a6a45}
+.message .message-meta{font-size:10.5px;color:#6b7b88}
+.message .message-meta strong{font-weight:700;color:#7a5a1e}

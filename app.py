@@ -7,6 +7,12 @@ from pathlib import Path
 from email.parser import BytesParser
 from email.policy import default
 
+try:
+    from zoneinfo import ZoneInfo
+    BR_TZ = ZoneInfo('America/Sao_Paulo')
+except Exception:
+    BR_TZ = datetime.timezone(datetime.timedelta(hours=-3))
+
 
 def _load_env_file():
     if os.getenv('APP_ENV') == 'test':
@@ -572,6 +578,59 @@ def appointment_when_from_fields(fields):
     raise ValidationError('Hora inv?lida.')
 
 
+def parse_db_timestamp(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return None
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+        return datetime.datetime.strptime(raw, '%Y-%m-%d').replace(tzinfo=BR_TZ)
+    normalized = raw.replace('Z', '+00:00')
+    parsed = None
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        for pattern in ('%Y-%m-%d %H:%M:%S.%f%z', '%Y-%m-%d %H:%M:%S%z', '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+            try:
+                parsed = datetime.datetime.strptime(raw, pattern)
+                break
+            except ValueError:
+                pass
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(BR_TZ)
+
+
+def format_db_datetime(value, include_time=True):
+    parsed = parse_db_timestamp(value)
+    if not parsed:
+        return str(value or '')
+    return parsed.strftime('%d/%m/%Y %H:%M' if include_time else '%d/%m/%Y')
+
+
+def format_message_time(value):
+    parsed = parse_db_timestamp(value)
+    return parsed.strftime('%H:%M') if parsed else ''
+
+
+def format_day_label(value):
+    parsed = parse_db_timestamp(value)
+    if not parsed:
+        return str(value or '')
+    today = datetime.datetime.now(BR_TZ).date()
+    day = parsed.date()
+    if day == today:
+        return 'Hoje'
+    if day == today - datetime.timedelta(days=1):
+        return 'Ontem'
+    return day.strftime('%d/%m/%Y')
+
+
+def format_message_day_separator(value):
+    return '<div class="message-day-separator"><span>' + esc(format_day_label(value)) + '</span></div>'
+
+
 def task_due_from_fields(fields):
     legacy = str(fields.get('due_at', '') or '').strip()
     if legacy:
@@ -709,19 +768,14 @@ def setting(c, key, default=''):
 
 
 def parse_dt(value):
-    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%d/%m/%Y %H:%M'):
-        try:
-            return datetime.datetime.strptime(str(value or ''), fmt)
-        except ValueError:
-            pass
-    return None
+    return parse_db_timestamp(value)
 
 
 def hours_since(value):
     parsed = parse_dt(value)
     if not parsed:
         return 10 ** 9
-    return max(0, (datetime.datetime.now() - parsed).total_seconds() / 3600)
+    return max(0, (datetime.datetime.now(BR_TZ) - parsed).total_seconds() / 3600)
 
 
 def status_color(status):
@@ -831,7 +885,7 @@ def task_priority_badge(priority):
 
 
 def client_case_cards(cases, stale_hours):
-    return ''.join('<div class="' + status_box_class('case-box', case['status'], case['last_activity_at'] or case['created'], stale_hours) + '"><h3>#' + str(case['id']) + ' — ' + esc(case['title']) + '</h3><p class="case-meta">' + status_badge(case['status']) + ' · atualizado em ' + esc(case['last_activity_at'] or case['updated'] or case['created']) + '</p>' + ('<p>' + esc(case['description'][:220]) + '</p>' if case['description'] else '') + '<p><a class="text-link" href="/cliente/atendimento/' + str(case['id']) + '">Consultar detalhes →</a></p></div>' for case in cases) or '<p class="muted">Nenhum atendimento cadastrado ainda.</p>'
+    return ''.join('<div class="' + status_box_class('case-box', case['status'], case['last_activity_at'] or case['created'], stale_hours) + '"><h3>#' + str(case['id']) + ' — ' + esc(case['title']) + '</h3><p class="case-meta">' + status_badge(case['status']) + ' · atualizado em ' + esc(format_db_datetime(case['last_activity_at'] or case['updated'] or case['created'])) + '</p>' + ('<p>' + esc(case['description'][:220]) + '</p>' if case['description'] else '') + '<p><a class="text-link" href="/cliente/atendimento/' + str(case['id']) + '">Consultar detalhes →</a></p></div>' for case in cases) or '<p class="muted">Nenhum atendimento cadastrado ainda.</p>'
 
 
 def client_messages_thread(messages, unread_hours):
@@ -841,7 +895,7 @@ def client_messages_thread(messages, unread_hours):
         unread = message['sender_role'] != 'client' and not message['read_by_client']
         alert = ' status-alert' if unread and hours_since(message['created']) >= unread_hours else ''
         badge = ' <span class="status-badge status-red">Nova</span>' if unread else ''
-        parts.append('<div class="message ' + ('client' if message['sender_role'] == 'client' else 'office') + (' unread' if unread else '') + alert + '"><p class="message-meta">' + label + ' · ' + esc(message['case_title'] or 'Caso geral') + ' · ' + esc(message['created']) + badge + '</p><p>' + esc(message['body']) + '</p></div>')
+        parts.append('<div class="message ' + ('client' if message['sender_role'] == 'client' else 'office') + (' unread' if unread else '') + alert + '"><p class="message-meta">' + label + ' · ' + esc(message['case_title'] or 'Caso geral') + ' · ' + esc(format_db_datetime(message['created'])) + badge + '</p><p>' + esc(message['body']) + '</p></div>')
     return ''.join(parts) or '<p class="muted">Nenhuma mensagem ainda. Envie uma mensagem para a equipe.</p>'
 
 
@@ -974,17 +1028,22 @@ def mentioned_user_ids(c, body):
 def team_chat_html(c, user):
     messages = c.execute("SELECT tm.*,u.name AS sender_name FROM team_chat_messages tm JOIN users u ON u.id=tm.sender_id ORDER BY tm.id DESC LIMIT 80").fetchall()
     parts = []
+    last_day = None
     for message in reversed(messages):
+        day_label = format_day_label(message['created'])
+        if day_label != last_day:
+            parts.append(format_message_day_separator(message['created']))
+            last_day = day_label
         attachment = ''
         if message['attachment_stored']:
             attachment = '<a class="message-attachment" href="/admin/chat-equipe/anexo/' + str(message['id']) + '">' + panel_icon('documents') + esc(message['attachment_filename']) + '</a>'
         mine = message['sender_id'] == user['id']
         side = 'client' if mine else 'office'
-        created = esc((message['created'] or '')[:16])
+        message_time = esc(format_message_time(message['created']))
         parts.append('<div class="message ' + side + ' team-message" data-avatar="' + esc(initials(message['sender_name'])) + '">' +
             '<span class="message-avatar" aria-hidden="true">' + esc(initials(message['sender_name'])) + '</span>' +
-            '<div class="message-body"><p class="message-meta"><strong>' + esc(message['sender_name']) + '</strong> · <time>' + created + '</time></p>' +
-            '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + attachment + '</div></div></div>')
+            '<div class="message-body"><p class="message-meta"><strong>' + esc(message['sender_name']) + '</strong></p>' +
+            '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + attachment + '<span class="message-time">' + message_time + '</span></div></div></div>')
     return ''.join(parts) or '<p class="muted">Nenhuma mensagem no chat da equipe.</p>'
 
 
@@ -998,14 +1057,23 @@ def team_chat_read(c, user):
 
 def guest_thread_html(session, messages, staff_view=False):
     parts = []
+    last_day = None
     for message in messages:
+        day_label = format_day_label(message['created'])
+        if day_label != last_day:
+            parts.append(format_message_day_separator(message['created']))
+            last_day = day_label
         if message['sender_role'] == 'guest':
             sender = session['name'] if staff_view else 'Você'
             side = 'client'
         else:
             sender = 'Equipe Bomfim & Lacerda'
             side = 'office'
-        parts.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '"><p class="message-meta">' + esc(sender) + ' · ' + esc(message['created']) + '</p><p>' + esc(message['body']) + '</p></div>')
+        message_time = esc(format_message_time(message['created']))
+        parts.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
+            '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
+            '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong></p>' +
+            '<div class="bubble"><p>' + esc(message['body']) + '</p><span class="message-time">' + message_time + '</span></div></div></div>')
     return ''.join(parts) or '<p class="muted">Nenhuma mensagem ainda.</p>'
 
 
@@ -1082,7 +1150,7 @@ def conversation_cards(rows, user, detail_base='/conversas/', dialog=True, retur
         if return_to:
             href += ('&' if '?' in detail_base else '?') + urllib.parse.urlencode({'return_to': return_to})
         card_class = 'conversation-card has-unread' if row['unread'] else 'conversation-card'
-        parts.append('<a class="' + card_class + '"' + (' data-conversation-link' if dialog else '') + ' href="' + href + '"><span class="conversation-card-top"><strong>' + esc(row['title']) + '</strong><span class="conversation-status status-' + tone + '">' + esc(label) + '</span></span><span class="conversation-context">' + context + '</span><span class="conversation-preview">' + esc((row['last_body'] or '')[:160]) + '</span><span class="conversation-meta">' + esc(row['updated'] or row['created']) + ' ' + unread + '</span></a>')
+        parts.append('<a class="' + card_class + '"' + (' data-conversation-link' if dialog else '') + ' href="' + href + '"><span class="conversation-card-top"><strong>' + esc(row['title']) + '</strong><span class="conversation-status status-' + tone + '">' + esc(label) + '</span></span><span class="conversation-context">' + context + '</span><span class="conversation-preview">' + esc((row['last_body'] or '')[:160]) + '</span><span class="conversation-meta">' + esc(format_db_datetime(row['updated'] or row['created'])) + ' ' + unread + '</span></a>')
     return ''.join(parts) or '<p class="muted">Nenhuma conversa nesta seção.</p>'
 
 
@@ -1633,7 +1701,7 @@ class Handler(BaseHTTPRequestHandler):
         bell = self.notif_bell()
         nav = self.panel_nav(user)
         chat_alert = '<div class="staff-chat-alert" id="staff-chat-alert" data-chat-alert-endpoint="/admin/chats/alertas"><a class="staff-chat-bubble" id="staff-chat-bubble" href="/admin/chats" aria-label="Abrir chat da equipe" title="Chat da equipe"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg><span class="staff-chat-badge" id="staff-chat-badge" hidden>0</span></a><div class="staff-chat-toast" id="staff-chat-toast" hidden><button type="button" class="staff-chat-toast-close" id="staff-chat-toast-close" aria-label="Fechar aviso">×</button><p class="staff-chat-toast-meta">Nova mensagem no chat</p><strong id="staff-chat-toast-name"></strong><p id="staff-chat-toast-body"></p><a id="staff-chat-toast-link" href="/admin/chats">Abrir atendimento →</a></div></div>'
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115m"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115m" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115o"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115o" defer></script></body></html>'''
 
     def chat_widget(self, user, csrf_token):
         with db() as c:
@@ -1660,7 +1728,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             nav += '<a class="nav-login" href="/entrar">Área do cliente</a>'
         widget = self.chat_widget(user, csrf_token) if not user or user['role'] == 'client' else ''
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115m"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115m" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115o"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115o" defer></script></body></html>'''
 
     def client_layout(self, title, content, user=None, description=None, csrf_token=''):
         desc = description or (str(title) + ' — Meu Espaço — Bomfim & Lacerda Advocacia.')
@@ -1680,7 +1748,7 @@ class Handler(BaseHTTPRequestHandler):
             nav.append('<a href="' + href + '"' + (' class="active" aria-current="page"' if active else '') + '>' + panel_icon(icon) + '<span>' + esc(label) + '</span>' + badge + '</a>')
         nav = ''.join(nav)
         widget = self.chat_widget(user, csrf_token)
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115m"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115m" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115o"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115o" defer></script></body></html>'''
 
     def page(self, title, content, user=None, status=200, description=None):
         data = self.session()
@@ -1864,7 +1932,12 @@ class Handler(BaseHTTPRequestHandler):
             attachments_by_message.setdefault(attachment['message_id'], []).append(attachment)
         is_internal = bool(conversation_meta and conversation_meta['visibility'] == 'internal')
         messages_html = []
+        last_day = None
         for message in messages:
+            day_label = format_day_label(message['created'])
+            if day_label != last_day:
+                messages_html.append(format_message_day_separator(message['created']))
+                last_day = day_label
             mine = message['sender_id'] == user['id']
             if mine:
                 sender = 'Você'
@@ -1879,7 +1952,7 @@ class Handler(BaseHTTPRequestHandler):
                 side = 'client'
             file_links = ''.join('<a class="message-attachment" href="/anexo/' + str(attachment['id']) + '">' + panel_icon('documents') + esc(attachment['filename']) + '</a>' for attachment in attachments_by_message.get(message['id'], []))
             unread_mark = '<span class="unread-mark" title="Não lida"></span>' if not message['read_by_staff'] and user['role'] != 'client' and not mine else ''
-            created = esc((message['created'] or '')[:16])
+            message_time = esc(format_message_time(message['created']))
             task_button = ''
             if is_internal and user['role'] in ('admin', 'staff'):
                 meta_case = conversation_meta['case_id'] if conversation_meta else ''
@@ -1887,8 +1960,8 @@ class Handler(BaseHTTPRequestHandler):
                 task_button = '<div class="message-tools"><button type="button" class="task-from-message" data-task-from-message="' + str(message['id']) + '" data-task-case="' + str(meta_case or '') + '" data-task-client="' + str(meta_client or '') + '" data-task-body="' + esc(message['body'][:200]) + '">' + panel_icon('tasks') + 'Criar tarefa a partir desta mensagem</button></div>'
             messages_html.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
                 '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
-                '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong> · <time>' + created + '</time>' + unread_mark + '</p>' +
-                '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '</div>' + task_button + '</div></div>')
+                '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong>' + unread_mark + '</p>' +
+                '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '<span class="message-time">' + message_time + '</span></div>' + task_button + '</div></div>')
         return ''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>', messages
 
     def conversation_view_html(self, c, user, conversation_id, return_to=''):
@@ -2218,18 +2291,18 @@ class Handler(BaseHTTPRequestHandler):
                 for appointment in reminder_appointments:
                     privacy = appointment['privacy'] or 'internal'
                     if appointment['client_id'] and privacy == 'client':
-                        notify(c, appointment['client_id'], 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + appointment['when_at'], '/cliente/compromissos', appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-client')
+                        notify(c, appointment['client_id'], 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + fmt_when(appointment['when_at']), '/cliente/compromissos', appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-client')
                         for uid in client_audience(c, appointment['client_id'], appointment['case_id']):
                             if uid != appointment['client_id']:
-                                notify(c, uid, 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + appointment['when_at'], '/admin/compromisso?appointment_id=' + str(appointment['id']), appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-u' + str(uid))
+                                notify(c, uid, 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + fmt_when(appointment['when_at']), '/admin/compromisso?appointment_id=' + str(appointment['id']), appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-u' + str(uid))
                     else:
                         owner = appointment['owner_id'] or appointment['created_by']
                         if owner:
-                            notify(c, owner, 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + appointment['when_at'], '/admin/compromisso?appointment_id=' + str(appointment['id']), appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-owner')
+                            notify(c, owner, 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + fmt_when(appointment['when_at']), '/admin/compromisso?appointment_id=' + str(appointment['id']), appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-owner')
                         if privacy != 'private':
                             for participant in c.execute('SELECT user_id FROM appointment_participants WHERE appointment_id=?', (appointment['id'],)).fetchall():
                                 if participant['user_id'] != owner:
-                                    notify(c, participant['user_id'], 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + appointment['when_at'], '/admin/compromisso?appointment_id=' + str(appointment['id']), appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-p' + str(participant['user_id']))
+                                    notify(c, participant['user_id'], 'appointment', 'Lembrete de compromisso', appointment['title'] + ' — ' + fmt_when(appointment['when_at']), '/admin/compromisso?appointment_id=' + str(appointment['id']), appointment['client_id'], appointment['case_id'], 'appointment-reminder-' + str(appointment['id']) + '-p' + str(participant['user_id']))
                     c.execute('UPDATE appointments SET reminder_sent=1 WHERE id=?', (appointment['id'],))
                 rows = c.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY CASE WHEN read_at='' THEN 0 ELSE 1 END,id DESC LIMIT 20", (user['id'],)).fetchall()
                 unread = c.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at=''", (user['id'],)).fetchone()[0]
@@ -2412,8 +2485,13 @@ class Handler(BaseHTTPRequestHandler):
                 can_reply = self.can_reply_conversation(c, user, conversation)
                 unread = conversation_unread(c, user, conversation_id)
             messages_html = []
+            last_day = None
             is_internal = conversation['visibility'] == 'internal'
             for message in messages:
+                day_label = format_day_label(message['created'])
+                if day_label != last_day:
+                    messages_html.append(format_message_day_separator(message['created']))
+                    last_day = day_label
                 if message['sender_id'] == user['id']:
                     sender = 'Você'
                 elif user['role'] == 'client' and message['sender_role'] != 'client' and not message['reveal_identity']:
@@ -2428,11 +2506,11 @@ class Handler(BaseHTTPRequestHandler):
                 if is_internal and message['sender_role'] == 'client':
                     side = 'client'
                 unread_mark = '<span class="unread-mark" title="Não lida pela equipe"></span>' if not message['read_by_staff'] and user['role'] != 'client' and message['sender_id'] != user['id'] else ''
-                created = esc((message['created'] or '')[:16])
+                message_time = esc(format_message_time(message['created']))
                 messages_html.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
                     '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
-                    '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong> · <time>' + created + '</time>' + unread_mark + '</p>' +
-                    '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '</div>' +
+                    '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong>' + unread_mark + '</p>' +
+                    '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '<span class="message-time">' + message_time + '</span></div>' +
                     ('<div class="message-tools">' + task_link + '</div>' if task_link else '') + '</div></div>')
             hidden = '<input type="hidden" name="conversation_id" value="' + str(conversation_id) + '">'
             reply_fields = hidden + '<label>Resposta<textarea name="body" rows="4"></textarea></label><label>Anexo (opcional)<input type="file" name="file"></label><p class="muted chat-attachment-hint">Permitidos: PDF, PNG, JPG e TXT, até 10 MB.</p>'
@@ -2502,12 +2580,12 @@ class Handler(BaseHTTPRequestHandler):
                 case_updates = c.execute('SELECT * FROM updates WHERE case_id=? AND client_id=? ORDER BY id DESC', (case_id, user['id'])).fetchall()
                 case_apps = c.execute("SELECT * FROM appointments WHERE case_id=? AND client_id=? AND privacy='client' AND deleted_at='' ORDER BY when_at", (case_id, user['id'])).fetchall()
                 case_reqs = c.execute('SELECT * FROM requests WHERE case_id=? AND client_id=? ORDER BY id DESC', (case_id, user['id'])).fetchall()
-            event_html = ''.join('<div class="request"><strong>' + esc(event['created']) + ' — ' + esc(event['description'] or event['event_type']) + '</strong>' + ('<p>Status: ' + esc(event['from_status']) + ' → ' + esc(event['to_status']) + '</p>' if event['from_status'] or event['to_status'] else '') + '</div>' for event in events) or '<p>Nenhum evento registrado.</p>'
+            event_html = ''.join('<div class="request"><strong>' + esc(format_db_datetime(event['created'])) + ' — ' + esc(event['description'] or event['event_type']) + '</strong>' + ('<p>Status: ' + esc(event['from_status']) + ' → ' + esc(event['to_status']) + '</p>' if event['from_status'] or event['to_status'] else '') + '</div>' for event in events) or '<p>Nenhum evento registrado.</p>'
             doc_html = ''.join('<li><a href="/arquivo/' + str(doc['id']) + '">' + esc(doc['filename']) + '</a> <small>(' + esc(doc['source']) + ')</small> ' + document_badge(doc['status']) + ((' · análise: ' + esc(doc['analysis_notes'])) if doc['analysis_notes'] else '') + '</li>' for doc in case_docs) or '<li>Nenhum documento.</li>'
-            update_html = ''.join(card(update['title'], '<p class="muted">' + esc(update['created']) + '</p><p>' + esc(update['body']) + '</p>') for update in case_updates) or '<p>Nenhuma atualização.</p>'
+            update_html = ''.join(card(update['title'], '<p class="muted">' + esc(format_db_datetime(update['created'])) + '</p><p>' + esc(update['body']) + '</p>') for update in case_updates) or '<p>Nenhuma atualização.</p>'
             app_html = ''.join('<li><strong>' + esc(fmt_when(app['when_at'])) + '</strong> — ' + esc(app['title']) + ' — ' + esc(app['notes']) + '</li>' for app in case_apps) or '<li>Nenhum compromisso.</li>'
             req_html = ''.join(card(req['subject'], '<p>' + esc(req['body']) + '</p>' + status_badge(req['status']) + '<p>' + esc(req['response']) + '</p>') for req in case_reqs) or '<p>Nenhuma solicitação.</p>'
-            detail = '<p><strong>Status:</strong> ' + status_badge(case_row['status']) + '</p><p><strong>Assunto informado:</strong> ' + esc(case_row['original_title'] or case_row['title']) + '</p><p><strong>Criado em:</strong> ' + esc(case_row['created']) + '</p><p>' + esc(case_row['description']) + '</p>'
+            detail = '<p><strong>Status:</strong> ' + status_badge(case_row['status']) + '</p><p><strong>Assunto informado:</strong> ' + esc(case_row['original_title'] or case_row['title']) + '</p><p><strong>Criado em:</strong> ' + esc(format_db_datetime(case_row['created'])) + '</p><p>' + esc(case_row['description']) + '</p>'
             content = '<section class="wrap section"><p class="eyebrow">MEU ATENDIMENTO</p><h1>' + esc(case_row['title']) + '</h1>' + card('Resumo', detail) + card('Conversas', conversation_cards(case_conversations, user, return_to='/cliente/atendimento/' + str(case_id)) + '<p><a class="text-link" href="/cliente/mensagens?case_id=' + str(case_id) + '">Iniciar novo assunto →</a></p>') + card('Documentos', '<ul>' + doc_html + '</ul>') + card('Atualizações', update_html) + card('Compromissos', '<ul>' + app_html + '</ul>') + card('Solicitações', req_html) + card('Histórico', event_html) + '<p><a class="text-link" href="/cliente/atendimentos">Voltar aos atendimentos</a></p></section>'
             return self.page('Meu atendimento', content, user)
         if path == '/cliente/atendimentos':
@@ -2568,7 +2646,7 @@ class Handler(BaseHTTPRequestHandler):
             with db() as c:
                 updates = c.execute("SELECT up.*, ca.title AS case_title FROM updates up LEFT JOIN cases ca ON ca.id=up.case_id WHERE up.client_id=? AND (up.case_id IS NULL OR up.case_id IN (SELECT id FROM cases WHERE deleted_at='')) ORDER BY up.id DESC", (user['id'],)).fetchall()
                 c.execute('UPDATE updates SET seen_by_client=1 WHERE client_id=? AND seen_by_client=0', (user['id'],))
-            items = ''.join(card(update['title'], '<p class="muted">' + esc(update['case_title'] or 'Caso geral') + ' · ' + esc(update['created']) + '</p><p>' + esc(update['body']) + '</p>') for update in updates) or '<p>Nenhuma atualização publicada.</p>'
+            items = ''.join(card(update['title'], '<p class="muted">' + esc(update['case_title'] or 'Caso geral') + ' · ' + esc(format_db_datetime(update['created'])) + '</p><p>' + esc(update['body']) + '</p>') for update in updates) or '<p>Nenhuma atualização publicada.</p>'
             content = '<section class="client-home"><div class="client-hero"><p class="eyebrow">ATUALIZAÇÕES</p><h1>Atualizações</h1><p>Informações e movimentações compartilhadas pelo escritório.</p></div>' + items + '<p><a class="text-link" href="/cliente">Voltar ao início</a></p></section>'
             return self.page('Atualizações', content, user)
         if path == '/cliente/novo':
@@ -2740,7 +2818,7 @@ class Handler(BaseHTTPRequestHandler):
                     writer.writerow([row['created'], row['actor'] or 'Sistema', row['action'], row['entity'] or '', row['entity_id'] or '', row['client_id'] or '', row['case_id'] or '', row['detail'], row['before'] or '', row['after'] or '', row['ip'] or ''])
                 return self.send(buffer.getvalue(), ctype='text/csv; charset=utf-8', headers={'Content-Disposition': 'attachment; filename="auditoria.csv"'})
             pages = max(1, (total + per - 1) // per)
-            items = ''.join('<tr><td>' + esc(x['created']) + '</td><td>' + esc(x['actor'] or 'Sistema') + '</td><td>' + esc(x['action']) + '</td><td>' + esc(x['entity'] or '') + (' #' + str(x['entity_id']) if x['entity_id'] else '') + '</td><td>' + esc(x['client_id'] or '') + ' / ' + esc(x['case_id'] or '') + '</td><td>' + esc(x['detail']) + '</td><td>' + esc((x['before'] or '')[:300]) + '</td><td>' + esc((x['after'] or '')[:300]) + '</td><td>' + esc(x['ip']) + '</td></tr>' for x in rows) or '<tr><td colspan="9">Nenhum registro.</td></tr>'
+            items = ''.join('<tr><td>' + esc(format_db_datetime(x['created'])) + '</td><td>' + esc(x['actor'] or 'Sistema') + '</td><td>' + esc(x['action']) + '</td><td>' + esc(x['entity'] or '') + (' #' + str(x['entity_id']) if x['entity_id'] else '') + '</td><td>' + esc(x['client_id'] or '') + ' / ' + esc(x['case_id'] or '') + '</td><td>' + esc(x['detail']) + '</td><td>' + esc((x['before'] or '')[:300]) + '</td><td>' + esc((x['after'] or '')[:300]) + '</td><td>' + esc(x['ip']) + '</td></tr>' for x in rows) or '<tr><td colspan="9">Nenhum registro.</td></tr>'
             actor_options = '<option value="">Todos os atores</option>' + ''.join('<option value="' + str(x['id']) + '"' + (' selected' if filters['actor'] == str(x['id']) else '') + '>' + esc(x['name']) + ' (' + esc(x['email']) + ')</option>' for x in actor_rows)
             entity_options = '<option value="">Todas as entidades</option>' + ''.join('<option value="' + esc(x['entity']) + '"' + (' selected' if filters['entity'] == x['entity'] else '') + '>' + esc(x['entity']) + '</option>' for x in entity_rows)
             filter_form = '<form method="get" action="/admin/auditoria"><label>Ator<select name="actor">' + actor_options + '</select></label><label>Entidade<select name="entity">' + entity_options + '</select></label><label>Ação<input name="action" value="' + esc(filters['action']) + '"></label><label>De<input type="date" name="from" value="' + esc(filters['from']) + '"></label><label>Até<input type="date" name="to" value="' + esc(filters['to']) + '"></label><button class="btn" type="submit">Filtrar</button></form>'
@@ -2774,7 +2852,7 @@ class Handler(BaseHTTPRequestHandler):
                 email_url = 'mailto:' + urllib.parse.quote(row['email'], safe='@.+-_') + '?subject=' + urllib.parse.quote('Retorno - Bomfim & Lacerda')
                 chat_link = ('<a class="btn" href="/admin/atendimento-visitante?guest_id=' + str(row['guest_id']) + '">Abrir conversa e responder</a> ' if row['guest_id'] else '')
                 contact_tone = {'novo': 'red', 'em_atendimento': 'blue', 'respondido': 'green', 'nao_classificado': 'gray'}.get(row['status'], 'gray')
-                items.append('<article class="case-box contact-queue status-border-' + contact_tone + '"><h3>' + esc(row['name']) + ' <span class="contact-state contact-state-' + esc(row['status']) + '">' + esc(statuses.get(row['status'], 'Não classificado')) + '</span></h3><p class="case-meta">' + esc(row['email']) + ' · ' + esc(row['created']) + ' · Responsável: ' + esc(row['responsible_name'] or 'Não atribuído') + '</p><p>' + esc(row['message']) + '</p><div class="quick-actions">' + chat_link + '<a class="text-link" href="' + esc(email_url) + '">Abrir resposta por e-mail →</a></div><details class="admin-secondary"><summary>Atualizar acompanhamento</summary>' + form('/admin/contato/status', fields, 'Salvar acompanhamento') + '</details></article>')
+                items.append('<article class="case-box contact-queue status-border-' + contact_tone + '"><h3>' + esc(row['name']) + ' <span class="contact-state contact-state-' + esc(row['status']) + '">' + esc(statuses.get(row['status'], 'Não classificado')) + '</span></h3><p class="case-meta">' + esc(row['email']) + ' · ' + esc(format_db_datetime(row['created'])) + ' · Responsável: ' + esc(row['responsible_name'] or 'Não atribuído') + '</p><p>' + esc(row['message']) + '</p><div class="quick-actions">' + chat_link + '<a class="text-link" href="' + esc(email_url) + '">Abrir resposta por e-mail →</a></div><details class="admin-secondary"><summary>Atualizar acompanhamento</summary>' + form('/admin/contato/status', fields, 'Salvar acompanhamento') + '</details></article>')
             status_options = ''.join('<option value="' + key + '"' + (' selected' if state == key else '') + '>' + label + '</option>' for key, label in [('ativos', 'Em aberto'), ('todos', 'Todos')] + list(statuses.items()))
             filters = '<form method="get" action="/admin/contatos" class="admin-filters"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Nome, e-mail ou mensagem"></label><label>Situação<select name="status">' + status_options + '</select></label><button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/contatos">Limpar</a></form>'
             body = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<h1>Mensagens de contato</h1><p class="muted">A fila e seus responsáveis são restritos aos super administradores. Abra a conversa para responder pelo próprio sistema; o e-mail continua disponível como alternativa.</p>' + filters + '<p class="muted">' + str(total) + ' contato(s) encontrado(s).</p>' + (''.join(items) or '<p>Nenhuma mensagem encontrada.</p>') + pagination + '</section>'
@@ -2839,7 +2917,7 @@ class Handler(BaseHTTPRequestHandler):
                 unread = ' <span class="conversation-unread">' + str(session['unread']) + ' nova(s)</span>' if session['unread'] else ''
                 tone = 'blue' if session['status'] == 'open' else 'green'
                 card_class = 'conversation-card has-unread' if session['unread'] else 'conversation-card'
-                items.append('<a class="' + card_class + '" href="/admin/atendimento-visitante?guest_id=' + str(session['id']) + '"><span class="conversation-card-top"><strong>' + esc(session['name']) + '</strong><span class="conversation-status status-' + tone + '">' + ('Em atendimento' if session['status'] == 'open' else 'Encerrado') + '</span></span><span class="conversation-context">' + esc(kind) + ' · ' + esc(session['email']) + ((' · ' + esc(session['contact_name'])) if session['contact_name'] else '') + '</span><span class="conversation-preview">' + esc((session['last_body'] or 'Sem mensagens ainda.')[:160]) + '</span><span class="conversation-meta">' + esc(session['last_message'] or session['created']) + unread + '</span></a>')
+                items.append('<a class="' + card_class + '" href="/admin/atendimento-visitante?guest_id=' + str(session['id']) + '"><span class="conversation-card-top"><strong>' + esc(session['name']) + '</strong><span class="conversation-status status-' + tone + '">' + ('Em atendimento' if session['status'] == 'open' else 'Encerrado') + '</span></span><span class="conversation-context">' + esc(kind) + ' · ' + esc(session['email']) + ((' · ' + esc(session['contact_name'])) if session['contact_name'] else '') + '</span><span class="conversation-preview">' + esc((session['last_body'] or 'Sem mensagens ainda.')[:160]) + '</span><span class="conversation-meta">' + esc(format_db_datetime(session['last_message'] or session['created'])) + unread + '</span></a>')
             options = ''.join('<option value="' + value + '"' + (' selected' if state == value else '') + '>' + label + '</option>' for value, label in (('abertos', 'Em aberto'), ('encerrados', 'Encerrados'), ('todos', 'Todos')))
             filters = '<form method="get" action="/admin/chats" class="admin-filters"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Nome, e-mail ou mensagem"></label><label>Situação<select name="status">' + options + '</select></label><button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/chats">Limpar</a></form>'
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<p class="eyebrow">CHAT AO VIVO</p><h1>Atendimentos do chat</h1><p class="muted">Conversas de clientes logados e visitantes. A atualização da página de atendimento é automática.</p>' + filters + '<p class="muted">' + str(total) + ' atendimento(s) encontrado(s).</p><div class="conversation-list" data-admin-chat-list>' + (''.join(items) or '<p class="muted">Nenhum atendimento encontrado.</p>') + '</div>' + pagination + '</section>'
@@ -3031,7 +3109,7 @@ class Handler(BaseHTTPRequestHandler):
                 kind_label = (' · ' + ('Advogado' if kind == 'lawyer' else 'Funcionário')) if x['role'] == 'staff' else ''
                 edit = input_field('Nome', 'name', x['name']) + input_field('E-mail', 'email', x['email'], 'email') + '<label>Perfil<select name="role">' + role_options + '</select></label><label>Função na equipe<select name="staff_kind">' + kind_options + '</select></label><label class="check"><input type="checkbox" name="active" value="1"' + active_checked + '> Ativo</label><label class="check"><input type="checkbox" name="is_super" value="1"' + super_checked + '> Super admin</label>' + input_field('Nova senha (opcional)', 'password', '', 'password', required=False)
                 mfa_reset = form('/admin/user/mfa-reset', '<input type="hidden" name="user_id" value="' + str(x['id']) + '">', 'Redefinir MFA') if x['totp_enabled'] else ''
-                blocks.append('<div class="case-box"><h3>' + esc(x['name']) + (' — super admin' if x['is_super'] else '') + '</h3><p class="case-meta">' + esc(x['email']) + ' · ' + role_labels.get(x['role'], x['role']) + kind_label + ' · ' + ('Ativo' if x['active'] else 'Inativo') + (' · MFA ativado' if x['totp_enabled'] else '') + ' · criado em ' + esc(x['created']) + '</p><details class="admin-secondary"><summary>Editar conta</summary>' + form('/admin/user/edit', '<input type="hidden" name="user_id" value="' + str(x['id']) + '">' + edit, 'Salvar alterações') + mfa_reset + '</details></div>')
+                blocks.append('<div class="case-box"><h3>' + esc(x['name']) + (' — super admin' if x['is_super'] else '') + '</h3><p class="case-meta">' + esc(x['email']) + ' · ' + role_labels.get(x['role'], x['role']) + kind_label + ' · ' + ('Ativo' if x['active'] else 'Inativo') + (' · MFA ativado' if x['totp_enabled'] else '') + ' · criado em ' + esc(format_db_datetime(x['created'])) + '</p><details class="admin-secondary"><summary>Editar conta</summary>' + form('/admin/user/edit', '<input type="hidden" name="user_id" value="' + str(x['id']) + '">' + edit, 'Salvar alterações') + mfa_reset + '</details></div>')
             create_form = form('/admin/user', field('Nome', 'name') + field('E-mail', 'email', 'email') + field('Senha inicial', 'password', 'password') + '<label>Perfil<select name="role"><option value="client">Cliente</option><option value="staff">Advogado ou funcionário</option><option value="admin">Administrador</option></select></label><label>Função na equipe<select name="staff_kind"><option value="lawyer">Advogado</option><option value="employee">Funcionário</option></select></label><label class="check"><input type="checkbox" name="is_super" value="1"> Super admin</label>', 'Cadastrar')
             role_options = '<option value="">Todos</option>' + ''.join('<option value="' + key + '"' + (' selected' if role_filter == key else '') + '>' + value + '</option>' for key, value in role_labels.items())
             state_options = ''.join('<option value="' + value + '"' + (' selected' if state == value else '') + '>' + label + '</option>' for value, label in (('', 'Todos'), ('ativo', 'Ativos'), ('inativo', 'Inativos')))
@@ -3073,8 +3151,8 @@ class Handler(BaseHTTPRequestHandler):
                     detail += ' (' + (event['from_status'] or '—') + ' → ' + (event['to_status'] or '—') + ')'
                 if event['old_title'] or event['new_title']:
                     detail += ' (' + (event['old_title'] or '—') + ' → ' + (event['new_title'] or '—') + ')'
-                event_items.append('<div class="request"><strong>' + esc(event['created']) + ' — ' + esc(event['event_type']) + '</strong><p>' + esc(detail) + '</p><p class="muted">' + esc(event['actor'] or 'Sistema') + ' · ' + ('visível ao cliente' if event['visible_to_client'] else 'interno') + '</p></div>')
-            details = '<p><strong>Cliente:</strong> <a class="text-link" href="/admin/cliente?client_id=' + str(case_row['client_id']) + '">' + esc(case_row['client_name']) + '</a></p><p><strong>Título original:</strong> ' + esc(case_row['original_title'] or case_row['title']) + '</p><p><strong>Responsável principal:</strong> ' + esc(case_row['responsible_name'] or 'Sem responsável') + '</p><p><strong>Equipe vinculada:</strong> ' + esc(', '.join(row['name'] for row in assigned) or 'Nenhuma') + '</p><p><strong>Status:</strong> ' + status_badge(case_row['status']) + '</p><p><strong>Origem:</strong> ' + esc(case_row['source'] or 'interno') + '</p><p><strong>Criado em:</strong> ' + esc(case_row['created']) + ' · <strong>Atualizado em:</strong> ' + esc(case_row['updated'] or case_row['created']) + '</p><p>' + esc(case_row['description']) + '</p>'
+                event_items.append('<div class="request"><strong>' + esc(format_db_datetime(event['created'])) + ' — ' + esc(event['event_type']) + '</strong><p>' + esc(detail) + '</p><p class="muted">' + esc(event['actor'] or 'Sistema') + ' · ' + ('visível ao cliente' if event['visible_to_client'] else 'interno') + '</p></div>')
+            details = '<p><strong>Cliente:</strong> <a class="text-link" href="/admin/cliente?client_id=' + str(case_row['client_id']) + '">' + esc(case_row['client_name']) + '</a></p><p><strong>Título original:</strong> ' + esc(case_row['original_title'] or case_row['title']) + '</p><p><strong>Responsável principal:</strong> ' + esc(case_row['responsible_name'] or 'Sem responsável') + '</p><p><strong>Equipe vinculada:</strong> ' + esc(', '.join(row['name'] for row in assigned) or 'Nenhuma') + '</p><p><strong>Status:</strong> ' + status_badge(case_row['status']) + '</p><p><strong>Origem:</strong> ' + esc(case_row['source'] or 'interno') + '</p><p><strong>Criado em:</strong> ' + esc(format_db_datetime(case_row['created'])) + ' · <strong>Atualizado em:</strong> ' + esc(format_db_datetime(case_row['updated'] or case_row['created'])) + '</p><p>' + esc(case_row['description']) + '</p>'
             if (is_super(user) or user['role'] == 'admin') and can_cases:
                 assigned_ids = {row['id'] for row in assigned}
                 choices = ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff if row['id'] not in assigned_ids and row['active'] and not row['deleted_at'])
@@ -3156,7 +3234,7 @@ class Handler(BaseHTTPRequestHandler):
                 edit_fields = f'<input type="hidden" name="case_id" value="{x["id"]}">' + input_field('Título do caso', 'title', x['title']) + input_field('Número do processo', 'case_number', x['case_number'], required=False) + input_field('Área', 'area', x['area'], required=False) + '<label>Status<select name="status">' + case_status_select + '</select></label><label>Descrição<textarea name="description">' + esc(x['description']) + '</textarea></label>' + responsible_field
                 edit_html = '<details class="conversation-new"><summary>Editar caso</summary>' + form('/admin/caso/editar', edit_fields, 'Salvar alterações') + '</details>' if x['id'] in editable_ids else '<p class="muted">Consulta disponível; alterações restritas ao responsável.</p>'
                 trash = '<details class="admin-secondary"><summary>Mais ações</summary>' + form('/admin/delete', '<input type="hidden" name="entity" value="case"><input type="hidden" name="record_id" value="' + str(x['id']) + '">', 'Mover para lixeira') + '</details>' if is_super(user) else ''
-                blocks.append('<div class="' + status_box_class('case-box', x['status'], x['last_activity_at'] or x['created'], stale_hours) + '"><h3>#' + str(x['id']) + ' — ' + esc(x['title']) + '</h3><p class="case-meta"><strong class="case-client-name">' + esc(x['client_name']) + '</strong> · ' + status_badge(x['status']) + ' · atualizado em ' + esc(x['updated'] or x['created']) + '</p>' + ('' if x['responsible_id'] else '<p><span class="status-badge status-yellow">Sem responsável</span></p>') + '<p><a class="text-link" href="/admin/caso/historico?case_id=' + str(x['id']) + '">Abrir ficha do atendimento →</a></p>' + edit_html + trash + '</div>')
+                blocks.append('<div class="' + status_box_class('case-box', x['status'], x['last_activity_at'] or x['created'], stale_hours) + '"><h3>#' + str(x['id']) + ' — ' + esc(x['title']) + '</h3><p class="case-meta"><strong class="case-client-name">' + esc(x['client_name']) + '</strong> · ' + status_badge(x['status']) + ' · atualizado em ' + esc(format_db_datetime(x['updated'] or x['created'])) + '</p>' + ('' if x['responsible_id'] else '<p><span class="status-badge status-yellow">Sem responsável</span></p>') + '<p><a class="text-link" href="/admin/caso/historico?case_id=' + str(x['id']) + '">Abrir ficha do atendimento →</a></p>' + edit_html + trash + '</div>')
             create_html = '<details class="conversation-new"><summary>Criar caso</summary>' + create_form + '</details>' if clients and can_edit_cases else ''
             status_filter = '<option value="">Todos</option>' + ''.join('<option value="' + esc(value) + '"' + (' selected' if case_status == value else '') + '>' + esc(value) + '</option>' for value in statuses)
             owner_filter = '<option value="">Todos</option><option value="sem"' + (' selected' if responsible == 'sem' else '') + '>Sem responsável</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if responsible == str(row['id']) else '') + '>' + esc(row['name']) + '</option>' for row in staff_only if row['active'] and not row['deleted_at'])
@@ -3218,7 +3296,7 @@ class Handler(BaseHTTPRequestHandler):
             valid_case = case_filter if any(str(row['id']) == case_filter and str(row['client_id']) == valid_client for row in upload_cases) else ''
             context = admin_context_hidden(clients, upload_cases, valid_client, valid_case)
             upload_form = form('/admin/document', context + admin_client_select(clients, valid_client) + admin_case_select(upload_cases, valid_case) + field('Arquivo', 'file', 'file'), 'Enviar arquivo', 'multipart/form-data') if clients else '<p class="muted">Nenhum cliente atribuído.</p>'
-            rows_html = ''.join('<tr><td>' + esc(x['created']) + '</td><td>' + esc(x['client']) + '</td><td>' + esc(x['case_title'] or 'Caso geral') + '</td><td><a href="/arquivo/' + str(x['id']) + '">' + esc(x['filename']) + '</a>' + (' <small><a class="text-link" href="/admin/documento?doc_id=' + str(x['id']) + '">Analisar</a></small>' if admin or (x['case_id'] in editable_cases if x['case_id'] else x['client_id'] in editable_clients) else '') + ('<details class="admin-secondary"><summary>Mais ações</summary>' + form('/admin/delete', '<input type="hidden" name="entity" value="document"><input type="hidden" name="record_id" value="' + str(x['id']) + '">', 'Mover para lixeira') + '</details>' if is_super(user) else '') + '</td><td>' + ('Recebido do cliente' if x['source'] == 'cliente' else 'Enviado pelo escritório') + '</td><td>' + esc(x['uploader'] or x['source']) + '</td><td>' + document_badge(x['status']) + '</td></tr>' for x in rows) or '<tr><td colspan="7">Nenhum arquivo encontrado.</td></tr>'
+            rows_html = ''.join('<tr><td>' + esc(format_db_datetime(x['created'])) + '</td><td>' + esc(x['client']) + '</td><td>' + esc(x['case_title'] or 'Caso geral') + '</td><td><a href="/arquivo/' + str(x['id']) + '">' + esc(x['filename']) + '</a>' + (' <small><a class="text-link" href="/admin/documento?doc_id=' + str(x['id']) + '">Analisar</a></small>' if admin or (x['case_id'] in editable_cases if x['case_id'] else x['client_id'] in editable_clients) else '') + ('<details class="admin-secondary"><summary>Mais ações</summary>' + form('/admin/delete', '<input type="hidden" name="entity" value="document"><input type="hidden" name="record_id" value="' + str(x['id']) + '">', 'Mover para lixeira') + '</details>' if is_super(user) else '') + '</td><td>' + ('Recebido do cliente' if x['source'] == 'cliente' else 'Enviado pelo escritório') + '</td><td>' + esc(x['uploader'] or x['source']) + '</td><td>' + document_badge(x['status']) + '</td></tr>' for x in rows) or '<tr><td colspan="7">Nenhum arquivo encontrado.</td></tr>'
             upload_section = '<details class="conversation-new"' + (' open' if query.get('novo') else '') + '><summary>Disponibilizar documento</summary>' + upload_form + '</details>'
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<h1>Central de arquivos</h1><p class="muted">Controle dos arquivos recebidos e enviados, por cliente e por caso.</p>' + upload_section + filters + ('<p class="muted">Exibindo apenas documentos que você pode analisar.</p>' if only_manageable else '') + '<p class="muted">' + str(total) + ' documento(s) encontrado(s).</p><div class="table-wrap"><table class="table"><thead><tr><th>Data</th><th>Cliente</th><th>Caso</th><th>Arquivo</th><th>Direção</th><th>Enviado por</th><th>Revisão</th></tr></thead><tbody>' + rows_html + '</tbody></table></div>' + pagination + '</section>'
             return self.page('Central de arquivos', content, user)
@@ -3297,7 +3375,7 @@ class Handler(BaseHTTPRequestHandler):
             if query.get('retorno', [''])[0] == '1':
                 context = '<input type="hidden" name="client_id" value="' + str(document['client_id']) + '">' + ('<input type="hidden" name="case_id" value="' + str(document['case_id']) + '">' if document['case_id'] else '') + '<input type="hidden" name="return_to" value="' + esc(admin_context_return(document['client_id'], document['case_id'])) + '">'
             status_form = form('/admin/documento/status', context + '<input type="hidden" name="doc_id" value="' + str(document_id) + '"><label>Status<select name="status">' + status_options + '</select></label><label>Análise do escritório<textarea name="analysis_notes">' + esc(document['analysis_notes']) + '</textarea></label>', 'Salvar análise')
-            details = '<p><strong>Cliente:</strong> ' + esc(document['client']) + '</p><p><strong>Caso:</strong> ' + esc(document['case_title'] or 'Caso geral') + '</p><p><strong>Arquivo:</strong> <a class="text-link" href="/arquivo/' + str(document_id) + '">' + esc(document['filename']) + '</a></p><p><strong>Origem:</strong> ' + esc(document['source']) + ' · <strong>Enviado por:</strong> ' + esc(document['uploader'] or document['source']) + '</p><p><strong>Status:</strong> ' + document_badge(document['status']) + '</p><p><strong>Recebido em:</strong> ' + esc(document['created']) + ' · <strong>Analisado por:</strong> ' + esc(document['reviewer'] or '—') + ((' · ' + esc(document['reviewed_at'])) if document['reviewed_at'] else '') + '</p>'
+            details = '<p><strong>Cliente:</strong> ' + esc(document['client']) + '</p><p><strong>Caso:</strong> ' + esc(document['case_title'] or 'Caso geral') + '</p><p><strong>Arquivo:</strong> <a class="text-link" href="/arquivo/' + str(document_id) + '">' + esc(document['filename']) + '</a></p><p><strong>Origem:</strong> ' + esc(document['source']) + ' · <strong>Enviado por:</strong> ' + esc(document['uploader'] or document['source']) + '</p><p><strong>Status:</strong> ' + document_badge(document['status']) + '</p><p><strong>Recebido em:</strong> ' + esc(format_db_datetime(document['created'])) + ' · <strong>Analisado por:</strong> ' + esc(document['reviewer'] or '—') + ((' · ' + esc(format_db_datetime(document['reviewed_at']))) if document['reviewed_at'] else '') + '</p>'
             content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Análise de documento</h1>' + card('Documento', details) + card('Análise', status_form) + '<p><a class="text-link" href="/admin/arquivos">Voltar aos documentos</a></p></section>'
             return self.page('Análise de documento', content, user)
         if path == '/admin/pendencias':
@@ -3408,7 +3486,7 @@ class Handler(BaseHTTPRequestHandler):
             collaborator_options = ''.join('<label class="check"><input type="checkbox" name="collaborator_' + str(row['id']) + '" value="1"' + (' checked' if row['id'] in collaborators else '') + '> ' + esc(row['name']) + '</label>' for row in staff)
             document_options = '<option value="">Sem documento vinculado</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if task['document_id'] == row['id'] else '') + '>' + esc(row['filename']) + '</option>' for row in documents)
             edit_form = form('/admin/tarefa/editar', '<input type="hidden" name="task_id" value="' + str(task_id) + '">' + input_field('Título', 'title', task['title']) + '<label>Descrição<textarea name="description" rows="4">' + esc(task['description']) + '</textarea></label>' + '<label>Cliente<select name="client_id" data-context-client>' + client_options + '</select></label><label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label><label>Responsável<select name="assigned_to">' + assign_options + '</select></label><fieldset class="check-group"><legend>Colaboradores</legend>' + collaborator_options + '</fieldset><label>Documento vinculado (opcional)<select name="document_id">' + document_options + '</select></label>' + task_due_fields(due_date_value, due_time_value) + '<label>Prioridade<select name="priority">' + priority_options + '</select></label><label>Situação<select name="status">' + status_options + '</select></label>', 'Salvar alterações')
-            history_html = ''.join('<li><strong>' + esc(item['created']) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
+            history_html = ''.join('<li><strong>' + esc(format_db_datetime(item['created'])) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
             delete_form = form('/admin/tarefa/excluir', '<input type="hidden" name="task_id" value="' + str(task_id) + '">', 'Excluir tarefa')
             subtask_items = ''.join('<li><form method="post" action="/admin/tarefa/subtarefa" class="inline-form"><input type="hidden" name="csrf" value="' + CSRF_PLACEHOLDER + '"><input type="hidden" name="task_id" value="' + str(task_id) + '"><input type="hidden" name="subtask_id" value="' + str(item['id']) + '"><input type="hidden" name="operation" value="toggle"><button class="text-link" type="submit">' + ('✓ ' if item['completed'] else '○ ') + esc(item['title']) + '</button></form> <form method="post" action="/admin/tarefa/subtarefa" class="inline-form"><input type="hidden" name="csrf" value="' + CSRF_PLACEHOLDER + '"><input type="hidden" name="task_id" value="' + str(task_id) + '"><input type="hidden" name="subtask_id" value="' + str(item['id']) + '"><input type="hidden" name="operation" value="delete"><button class="text-link" type="submit" aria-label="Excluir subtarefa">×</button></form></li>' for item in subtasks) or '<li>Nenhuma subtarefa.</li>'
             subtask_form = form('/admin/tarefa/subtarefa', '<input type="hidden" name="task_id" value="' + str(task_id) + '"><input type="hidden" name="operation" value="add">' + field('Nova subtarefa', 'title'), 'Adicionar subtarefa')
@@ -3494,7 +3572,7 @@ class Handler(BaseHTTPRequestHandler):
             case_options = '<option value="">Sem caso específico</option>' + ''.join('<option value="' + str(row['id']) + '" data-client-id="' + str(row['client_id']) + '"' + (' selected' if document['case_id'] == row['id'] else '') + '>#' + str(row['id']) + ' — ' + esc(row['title']) + '</option>' for row in cases)
             visibility_options = ''.join('<option value="' + value + '"' + (' selected' if document['visibility'] == value else '') + '>' + label + '</option>' for value, label in (('equipe', 'Toda a equipe'), ('caso', 'Somente equipe do caso')))
             edit_form = form('/admin/documento-interno/editar', '<input type="hidden" name="doc_id" value="' + str(document_id) + '">' + input_field('Título', 'title', document['title']) + input_field('Categoria', 'category', document['category'], required=False) + '<label>Cliente<select name="client_id" data-context-client>' + client_options + '</select></label><label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label><label>Visibilidade<select name="visibility">' + visibility_options + '</select></label>', 'Salvar alterações') if can_edit else '<p class="muted">Somente o autor ou um administrador pode editar este documento.</p>'
-            history_html = ''.join('<li><strong>' + esc(item['created']) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
+            history_html = ''.join('<li><strong>' + esc(format_db_datetime(item['created'])) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
             delete_form = form('/admin/documento-interno/excluir', '<input type="hidden" name="doc_id" value="' + str(document_id) + '">', 'Remover documento') if can_edit else ''
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/documentos-internos">← Documentos internos</a><p class="eyebrow">DOCUMENTO INTERNO</p><h1>' + esc(document['title']) + '</h1><p class="muted">' + esc(document['category'] or 'Documento interno') + ' · ' + esc(document['filename']) + ' · ' + esc(document['case_title'] or document['client_name'] or 'Uso interno') + ' · ' + ('Toda a equipe' if document['visibility'] == 'equipe' else 'Equipe do caso') + '</p><div class="quick-actions"><a class="btn" href="/interno/' + str(document_id) + '">Baixar arquivo</a></div><div class="panel-dash-grid"><div class="panel-col">' + panel_card('Editar informações', edit_form) + '</div><div class="panel-col">' + panel_card('Histórico', '<ul class="panel-attention">' + history_html + '</ul>') + (panel_card('Remover', '<p class="muted">O documento deixa de aparecer nas listas e não poderá mais ser baixado.</p>' + delete_form) if delete_form else '') + '</div></div></section>'
             return self.page('Documento interno', content, user)
@@ -3520,7 +3598,7 @@ class Handler(BaseHTTPRequestHandler):
             visibility_options = '<option value="equipe">Toda a equipe</option><option value="caso">Somente equipe do caso</option>'
             upload_form = form('/admin/documento-interno', field('Título', 'title') + field('Categoria', 'category', required=False) + client_select + case_select + '<label>Visibilidade<select name="visibility">' + visibility_options + '</select></label>' + field('Arquivo', 'file', 'file'), 'Enviar documento interno', 'multipart/form-data')
             filters = '<form method="get" action="/admin/documentos-internos" class="admin-filters"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Título, categoria ou cliente"></label><button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/documentos-internos">Limpar</a></form>'
-            items = ''.join('<div class="internal-doc"><span class="internal-doc-icon">' + panel_icon('documents') + '</span><div><strong>' + esc(document['title']) + '</strong><p class="task-meta">' + esc(document['category'] or 'Documento interno') + ' · ' + esc(document['filename']) + '</p><p class="task-meta">' + esc(document['case_title'] or document['client_name'] or 'Uso interno') + ' · ' + ('Toda a equipe' if document['visibility'] == 'equipe' else 'Equipe do caso') + ' · enviado por ' + esc(document['uploader'] or '—') + ' em ' + esc(document['created']) + '</p></div><div class="internal-doc-actions"><a class="btn ghost" href="/interno/' + str(document['id']) + '">Baixar</a> <a class="text-link" href="/admin/documento-interno?doc_id=' + str(document['id']) + '">Editar</a></div></div>' for document in documents) or '<p class="muted">Nenhum documento interno encontrado.</p>'
+            items = ''.join('<div class="internal-doc"><span class="internal-doc-icon">' + panel_icon('documents') + '</span><div><strong>' + esc(document['title']) + '</strong><p class="task-meta">' + esc(document['category'] or 'Documento interno') + ' · ' + esc(document['filename']) + '</p><p class="task-meta">' + esc(document['case_title'] or document['client_name'] or 'Uso interno') + ' · ' + ('Toda a equipe' if document['visibility'] == 'equipe' else 'Equipe do caso') + ' · enviado por ' + esc(document['uploader'] or '—') + ' em ' + esc(format_db_datetime(document['created'])) + '</p></div><div class="internal-doc-actions"><a class="btn ghost" href="/interno/' + str(document['id']) + '">Baixar</a> <a class="text-link" href="/admin/documento-interno?doc_id=' + str(document['id']) + '">Editar</a></div></div>' for document in documents) or '<p class="muted">Nenhum documento interno encontrado.</p>'
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<p class="eyebrow">DOCUMENTOS INTERNOS</p><h1>Central de documentos internos</h1><p class="muted">Compartilhe pareceres, modelos e arquivos de apoio com a equipe. O cliente não acessa esta área.</p><details class="conversation-new"' + (' open' if query.get('novo') else '') + '><summary>Enviar documento interno</summary>' + upload_form + '</details>' + filters + '<h2>Documentos <small class="result-count">' + str(total) + '</small></h2><div class="internal-doc-list">' + items + '</div>' + pagination + '</section>'
             return self.page('Documentos internos', content, user)
         if path == '/admin/solicitacoes':
@@ -3586,7 +3664,7 @@ class Handler(BaseHTTPRequestHandler):
             when_date_value = when_raw[:10] if len(when_raw) >= 10 else ''
             when_time_value = when_raw[11:16] if len(when_raw) >= 16 else ''
             form_html = form('/admin/compromisso/editar', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '">' + input_field('Título do evento', 'title', appointment['title']) + '<label>Tipo<select name="kind">' + kind_options + '</select></label><label>Privacidade<select name="privacy">' + privacy_options + '</select></label>' + '<label>Cliente (opcional)<select name="client_id" data-context-client>' + client_options + '</select></label>' + '<label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label>' + '<label>Responsável<select name="owner_id">' + owner_options + '</select></label>' + participants_select + appointment_when_fields(when_date_value, when_time_value) + input_field('Local ou link', 'location', appointment['location'], required=False) + '<label>Lembrete<select name="reminder_choice">' + reminder_options + '</select></label><label>Situação<select name="status">' + status_options + '</select></label><label>Orientações<textarea name="notes">' + esc(appointment['notes']) + '</textarea></label>', 'Salvar alterações')
-            history_html = ''.join('<li><strong>' + esc(item['created']) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
+            history_html = ''.join('<li><strong>' + esc(format_db_datetime(item['created'])) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
             cancel_form = form('/admin/compromisso/status', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '"><input type="hidden" name="status" value="cancelado">', 'Cancelar evento') if appointment['status'] != 'cancelado' else ''
             delete_form = form('/admin/compromisso/excluir', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '">', 'Excluir evento') if is_super(user) or appointment['created_by'] == user['id'] else ''
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/compromissos">← Agenda</a><p class="eyebrow">EVENTO DA AGENDA</p><h1>' + esc(appointment['title']) + '</h1><p class="muted">' + esc(appointment['client_name'] or 'Evento interno') + ((' · ' + esc(appointment['case_title'])) if appointment['case_title'] else '') + ' · ' + esc(fmt_when(appointment['when_at'])) + ' · ' + esc(appointment['owner_name'] or 'Sem responsável') + '</p><div class="panel-dash-grid"><div class="panel-col">' + panel_card('Editar evento', form_html) + '</div><div class="panel-col">' + panel_card('Histórico', '<ul class="panel-attention">' + history_html + '</ul>') + panel_card('Ações', (cancel_form or '<p class="muted">Evento já cancelado.</p>') + (delete_form if delete_form else '<p class="muted">Somente o criador ou o administrador principal pode excluir.</p>')) + '</div></div></section>'
@@ -3714,7 +3792,7 @@ class Handler(BaseHTTPRequestHandler):
             case_options = '<option value="">Sem caso específico</option>' + ''.join(f'<option value="{x["id"]}">#{x["id"]} — {esc(x["title"])} ({esc(x["client_name"])})</option>' for x in cases)
             case_select = '<label>Caso<select name="case_id">' + case_options + '</select></label>'
             create_form = form('/admin/update', select + case_select + field('Título', 'title') + '<label>Descrição<textarea name="body" required></textarea></label>', 'Publicar') if clients else '<p class="muted">Nenhum cliente atribuído.</p>'
-            items = ''.join(card(update['title'], '<p class="muted">' + esc(update['client']) + ' · ' + esc(update['case_title'] or 'Caso geral') + ' · ' + esc(update['created']) + '</p><p>' + esc(update['body']) + '</p>') for update in update_rows) or '<p>Nenhuma atualização.</p>'
+            items = ''.join(card(update['title'], '<p class="muted">' + esc(update['client']) + ' · ' + esc(update['case_title'] or 'Caso geral') + ' · ' + esc(format_db_datetime(update['created'])) + '</p><p>' + esc(update['body']) + '</p>') for update in update_rows) or '<p>Nenhuma atualização.</p>'
             content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Atualizações</h1>' + card('Publicar atualização', create_form) + card('Publicações', '<div class="publication-list">' + items + '</div>') + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
             return self.page('Atualizações', content, user)
         if path == '/admin/conteudos':
@@ -3723,7 +3801,7 @@ class Handler(BaseHTTPRequestHandler):
             with db() as c:
                 posts = c.execute('SELECT * FROM posts ORDER BY id DESC').fetchall()
             create_form = form('/admin/post', field('Título', 'title') + field('Categoria', 'category') + '<label>Texto<textarea name="body" required></textarea></label><label class="check"><input type="checkbox" name="published" value="1"> Publicar no site</label>', 'Salvar conteúdo')
-            items = ''.join('<li>' + esc(post['title']) + ' — ' + ('Publicado' if post['published'] else 'Rascunho') + ' — ' + esc(post['created']) + '</li>' for post in posts) or '<li>Nenhum conteúdo.</li>'
+            items = ''.join('<li>' + esc(post['title']) + ' — ' + ('Publicado' if post['published'] else 'Rascunho') + ' — ' + esc(format_db_datetime(post['created'])) + '</li>' for post in posts) or '<li>Nenhum conteúdo.</li>'
             content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Conteúdos jurídicos</h1>' + card('Novo conteúdo', create_form) + card('Publicações', '<ul class="publication-list">' + items + '</ul>') + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
             return self.page('Conteúdos jurídicos', content, user)
         if path == '/admin/faq':
@@ -3737,7 +3815,7 @@ class Handler(BaseHTTPRequestHandler):
             items = []
             for faq in faqs:
                 edit_form = form('/admin/faq/editar', '<input type="hidden" name="faq_id" value="' + str(faq['id']) + '">' + '<label>Categoria<select name="category">' + ''.join('<option value="' + esc(name) + '"' + (' selected' if name == faq['category'] else '') + '>' + esc(name) + '</option>' for name in category_names) + '</select></label>' + input_field('Pergunta', 'question', faq['question']) + '<label>Resposta<textarea name="answer" required>' + esc(faq['answer']) + '</textarea></label>' + input_field('Ordem', 'sort_order', faq['sort_order'], 'number', required=False) + '<label class="check"><input type="checkbox" name="published" value="1"' + (' checked' if faq['published'] else '') + '> Publicado</label>', 'Salvar alterações')
-                items.append('<article class="faq-admin-item"><div class="faq-admin-head"><div><span class="contact-state">' + esc(faq['category'] or 'Geral') + '</span><h3>' + esc(faq['question']) + '</h3></div><span class="status-badge status-' + ('green' if faq['published'] else 'gray') + '">' + ('Publicado' if faq['published'] else 'Rascunho') + '</span></div><p class="muted">Ordem: ' + str(faq['sort_order']) + ' · atualizado em ' + esc(faq['updated'] or '—') + '</p><details class="admin-secondary"><summary>Editar pergunta</summary>' + edit_form + '</details></article>')
+                items.append('<article class="faq-admin-item"><div class="faq-admin-head"><div><span class="contact-state">' + esc(faq['category'] or 'Geral') + '</span><h3>' + esc(faq['question']) + '</h3></div><span class="status-badge status-' + ('green' if faq['published'] else 'gray') + '">' + ('Publicado' if faq['published'] else 'Rascunho') + '</span></div><p class="muted">Ordem: ' + str(faq['sort_order']) + ' · atualizado em ' + (esc(format_db_datetime(faq['updated'])) if faq['updated'] else '—') + '</p><details class="admin-secondary"><summary>Editar pergunta</summary>' + edit_form + '</details></article>')
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<h1>Perguntas frequentes</h1><p class="muted">Gerencie categorias, ordem e publicação. A página pública exibe apenas perguntas publicadas.</p><div class="quick-actions"><a class="btn ghost" href="/faq">Ver página pública</a></div><details class="conversation-new"><summary>Nova pergunta</summary>' + create_form + '</details>' + ('<div class="faq-admin-list">' + ''.join(items) + '</div>' or '<p>Nenhuma pergunta cadastrada.</p>') + '</section>'
             return self.page('Perguntas frequentes', content, user)
         if path == '/admin/busca':
@@ -5352,15 +5430,15 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute('INSERT OR IGNORE INTO appointment_participants(appointment_id,user_id) VALUES(?,?)', (appointment_id, participant_id))
                         touch_case(c, case_id or None)
                         if client and privacy == 'client':
-                            notify(c, client, 'appointment', 'Novo compromisso', title + ' — ' + when_at, '/cliente', client, case_id or None, 'appointment-' + str(appointment_id) + '-client')
+                            notify(c, client, 'appointment', 'Novo compromisso', title + ' — ' + fmt_when(when_at), '/cliente', client, case_id or None, 'appointment-' + str(appointment_id) + '-client')
                             for uid in client_audience(c, client, case_id or None):
                                 if uid != user['id']:
-                                    notify(c, uid, 'appointment', 'Novo compromisso', title + ' — ' + when_at, '/admin', client, case_id or None, 'appointment-' + str(appointment_id) + '-u' + str(uid))
+                                    notify(c, uid, 'appointment', 'Novo compromisso', title + ' — ' + fmt_when(when_at), '/admin', client, case_id or None, 'appointment-' + str(appointment_id) + '-u' + str(uid))
                         if owner_id != user['id']:
-                            notify(c, owner_id, 'appointment', 'Compromisso sob sua responsabilidade', title + ' — ' + when_at, '/admin/compromisso?appointment_id=' + str(appointment_id), client or None, case_id or None, 'appointment-' + str(appointment_id) + '-owner')
+                            notify(c, owner_id, 'appointment', 'Compromisso sob sua responsabilidade', title + ' — ' + fmt_when(when_at), '/admin/compromisso?appointment_id=' + str(appointment_id), client or None, case_id or None, 'appointment-' + str(appointment_id) + '-owner')
                         for participant_id in participant_ids:
                             if participant_id not in (user['id'], owner_id):
-                                notify(c, participant_id, 'appointment', 'Você foi incluído em um compromisso', title + ' — ' + when_at, '/admin/compromisso?appointment_id=' + str(appointment_id), client or None, case_id or None, 'appointment-' + str(appointment_id) + '-p' + str(participant_id))
+                                notify(c, participant_id, 'appointment', 'Você foi incluído em um compromisso', title + ' — ' + fmt_when(when_at), '/admin/compromisso?appointment_id=' + str(appointment_id), client or None, case_id or None, 'appointment-' + str(appointment_id) + '-p' + str(participant_id))
                         self.audit_action(c, user['id'], 'criar compromisso', title, entity='appointment', client_id=client or None, case_id=case_id or None, after={'title': title, 'when_at': when_at, 'notes': notes, 'reminder_at': reminder_at, 'reminder_choice': reminder_choice, 'kind': kind, 'owner_id': owner_id, 'location': location, 'privacy': privacy, 'participants': participant_ids})
                     redirect_to = '/admin/atualizacoes' if path == '/admin/update' else '/admin/compromissos'
                 elif path == '/admin/respond':

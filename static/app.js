@@ -287,8 +287,19 @@ if (notifWrap) {
   };
 
   const formatDate = (value) => {
-    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2})/);
-    return match ? `${match[3]}/${match[2]}/${match[1]} às ${match[4]}` : String(value || '');
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    let normalized = raw.replace(' ', 'T');
+    normalized = normalized.replace(/(\.\d{3})\d+/, '$1');
+    normalized = normalized.replace(/([+-]\d{2})$/, '$1:00');
+    if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized)) normalized += 'Z';
+    const parsed = new Date(normalized);
+    if (Number.isNaN(parsed.getTime())) return raw;
+    return new Intl.DateTimeFormat('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(parsed).replace(',', ' às');
   };
 
   const renderList = () => {
