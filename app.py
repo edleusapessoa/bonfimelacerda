@@ -1,5 +1,5 @@
 """Bomfim & Lacerda — aplicação local de testes (não publicar na Internet)."""
-import os, sys, sqlite3, secrets, hashlib, hmac, html, mimetypes, urllib.parse, datetime, calendar, threading, time, re, shutil, traceback, subprocess, json, zipfile, csv, io, base64
+import os, sys, sqlite3, secrets, hashlib, hmac, html, mimetypes, urllib.parse, datetime, calendar, threading, time, re, shutil, traceback, subprocess, json, zipfile, csv, io, base64, socket
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
@@ -7,8 +7,33 @@ from pathlib import Path
 from email.parser import BytesParser
 from email.policy import default
 
+
+def _load_env_file():
+    if os.getenv('APP_ENV') == 'test':
+        return
+    env_file = Path(__file__).resolve().parent / '.env'
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env_file()
+
+import db_compat
+from db_compat import IS_POSTGRES, IntegrityError
+
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.getenv('APP_DB', str(ROOT / 'private' / 'app.db'))).resolve()
+if db_compat.SQLITE_URL_PATH:
+    sqlite_db = db_compat.SQLITE_URL_PATH
+    if not sqlite_db.is_absolute():
+        sqlite_db = ROOT / sqlite_db
+    DB = sqlite_db.resolve()
 UP = Path(os.getenv('APP_UPLOADS', str(ROOT / 'private' / 'uploads'))).resolve()
 UP.mkdir(parents=True, exist_ok=True)
 DB.parent.mkdir(parents=True, exist_ok=True)
@@ -85,10 +110,7 @@ class ValidationError(Exception):
 
 @contextmanager
 def db():
-    c = sqlite3.connect(DB, timeout=10)
-    c.row_factory = sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
-    c.execute('PRAGMA busy_timeout=5000')
+    c = db_compat.connect(DB)
     try:
         with c:
             yield c
@@ -97,15 +119,17 @@ def db():
 
 
 def ensure_column(c, table, column, decl):
-    cols = {r[1] for r in c.execute('PRAGMA table_info(' + table + ')')}
+    cols = {row['name'] for row in db_compat.table_columns(c, table)}
     if column not in cols:
         c.execute('ALTER TABLE ' + table + ' ADD COLUMN ' + column + ' ' + decl)
 
 
 def migrate_appointments_nullable(c):
-    info = list(c.execute('PRAGMA table_info(appointments)'))
-    client_column = next((row for row in info if row[1] == 'client_id'), None)
-    if not client_column or not client_column[3]:
+    if IS_POSTGRES:
+        return
+    info = db_compat.table_columns(c, 'appointments')
+    client_column = next((row for row in info if row['name'] == 'client_id'), None)
+    if not client_column or not client_column['notnull']:
         return
     c.execute("""CREATE TABLE appointments_new(
         id INTEGER PRIMARY KEY,
@@ -136,6 +160,8 @@ SCHEMA_VERSION = 21
 
 def schema_version():
     with db() as c:
+        if IS_POSTGRES:
+            c.execute("SELECT pg_advisory_xact_lock(hashtext('bomfim_lacerda_schema'))")
         c.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)')
         row = c.execute('SELECT MAX(version) FROM schema_migrations').fetchone()
     return row[0] if row and row[0] else 0
@@ -145,6 +171,12 @@ def backup_before_migration(current_version):
     backup_dir = DB.parent / 'backups'
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    if IS_POSTGRES:
+        target = backup_dir / f'postgres-v{current_version}-to-v{SCHEMA_VERSION}-{stamp}.dump'
+        pg_dump = shutil.which('pg_dump')
+        if pg_dump:
+            subprocess.run([pg_dump, '--dbname', db_compat.DATABASE_URL, '--format=custom', '--file', str(target)], check=False)
+        return target
     target = backup_dir / f'app-v{current_version}-to-v{SCHEMA_VERSION}-{stamp}.db'
     source = sqlite3.connect(DB)
     destination = sqlite3.connect(target)
@@ -167,13 +199,17 @@ def backup_before_migration(current_version):
 
 
 def init():
-    existed = DB.exists() and DB.stat().st_size > 0
     current_version = schema_version()
+    existed = current_version > 0 if IS_POSTGRES else (DB.exists() and DB.stat().st_size > 0)
+    fresh_postgres = IS_POSTGRES and current_version == 0
     if existed and current_version < SCHEMA_VERSION:
         backup_before_migration(current_version)
     with db() as c:
-        c.execute('PRAGMA journal_mode=WAL')
-        c.executescript("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','staff','client')),active INTEGER NOT NULL DEFAULT 1,must_change INTEGER NOT NULL DEFAULT 0,is_super INTEGER NOT NULL DEFAULT 0,portal_enabled INTEGER NOT NULL DEFAULT 1,phone TEXT DEFAULT '',avatar TEXT DEFAULT '',cover TEXT DEFAULT '',created_by INTEGER,owner_staff_id INTEGER,deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
+        if IS_POSTGRES:
+            c.execute("SELECT pg_advisory_xact_lock(hashtext('bomfim_lacerda_init'))")
+        else:
+            c.execute('PRAGMA journal_mode=WAL')
+        c.executescript(db_compat.postgres_schema("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','staff','client')),active INTEGER NOT NULL DEFAULT 1,must_change INTEGER NOT NULL DEFAULT 0,is_super INTEGER NOT NULL DEFAULT 0,portal_enabled INTEGER NOT NULL DEFAULT 1,phone TEXT DEFAULT '',avatar TEXT DEFAULT '',cover TEXT DEFAULT '',created_by INTEGER,owner_staff_id INTEGER,deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS cases(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),title TEXT NOT NULL,original_title TEXT DEFAULT '',case_number TEXT DEFAULT '',area TEXT DEFAULT '',status TEXT DEFAULT 'Em andamento',description TEXT DEFAULT '',responsible_id INTEGER REFERENCES users(id),created_by INTEGER REFERENCES users(id),source TEXT DEFAULT 'interno',last_activity_at TEXT DEFAULT '',deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP,updated TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS case_assignments(id INTEGER PRIMARY KEY,case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,staff_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(case_id,staff_id));
 CREATE TABLE IF NOT EXISTS case_events(id INTEGER PRIMARY KEY,case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,actor_id INTEGER REFERENCES users(id),event_type TEXT NOT NULL,description TEXT DEFAULT '',from_status TEXT DEFAULT '',to_status TEXT DEFAULT '',old_title TEXT DEFAULT '',new_title TEXT DEFAULT '',visible_to_client INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -218,7 +254,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_client ON messages(client_id,visibility)
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id,read_at);
 CREATE INDEX IF NOT EXISTS idx_case_events_case ON case_events(case_id);
 CREATE INDEX IF NOT EXISTS idx_pendencies_client ON pendencies(client_id,status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user_id,dedupe_key) WHERE dedupe_key<>'';""")
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user_id,dedupe_key) WHERE dedupe_key<>'';"""))
         ensure_column(c, 'users', 'must_change', 'INTEGER NOT NULL DEFAULT 0')
         ensure_column(c, 'users', 'is_super', 'INTEGER NOT NULL DEFAULT 0')
         ensure_column(c, 'users', 'portal_enabled', 'INTEGER NOT NULL DEFAULT 1')
@@ -314,7 +350,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
         ensure_column(c, 'messages', 'conversation_id', 'INTEGER REFERENCES conversations(id) ON DELETE SET NULL')
         c.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id,id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_conversations_client ON conversations(client_id,status,updated)')
-        if current_version < 3:
+        if not fresh_postgres and current_version < 3:
             for row in c.execute('SELECT id,created,updated FROM cases').fetchall():
                 values = [row['created'], row['updated']]
                 for table in ('messages', 'documents', 'updates', 'appointments', 'requests'):
@@ -324,10 +360,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
                 c.execute('UPDATE cases SET last_activity_at=? WHERE id=?', (max(values), row['id']))
             for row in c.execute('SELECT id,created,responded_at FROM requests').fetchall():
                 c.execute('UPDATE requests SET last_activity_at=? WHERE id=?', (max([row['created'], row['responded_at']]), row['id']))
-        if current_version < 4:
+        if not fresh_postgres and current_version < 4:
             c.execute("UPDATE cases SET original_title=title WHERE original_title=''")
             c.execute('UPDATE cases SET created_by=responsible_id WHERE created_by IS NULL')
-        if current_version < 6:
+        if not fresh_postgres and current_version < 6:
             c.execute("UPDATE documents SET status='disponibilizado' WHERE source='escritório'")
             c.execute("UPDATE documents SET status='analisado' WHERE reviewed=1 AND source='cliente'")
             reminder_hours = 24
@@ -347,7 +383,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
                 if parsed:
                     reminder_at = (parsed - datetime.timedelta(hours=reminder_hours)).strftime('%Y-%m-%d %H:%M')
                     c.execute("UPDATE appointments SET status=COALESCE(NULLIF(status,''),'pendente'), reminder_at=?, reminder_sent=0 WHERE id=?", (reminder_at, appointment['id']))
-        if current_version < 8:
+        if not fresh_postgres and current_version < 8:
             groups = c.execute("SELECT m.client_id,m.case_id,m.visibility,MIN(m.created) AS created,MAX(m.created) AS updated FROM messages m WHERE m.conversation_id IS NULL GROUP BY m.client_id,m.case_id,m.visibility").fetchall()
             for group in groups:
                 cursor = c.execute("INSERT INTO conversations(client_id,case_id,title,visibility,status,created,updated) VALUES(?,?,? ,?,'legacy',?,?)", (group['client_id'], group['case_id'], 'Histórico anterior', group['visibility'], group['created'], group['updated']))
@@ -360,7 +396,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
                         c.execute('UPDATE notifications SET url=? WHERE id=?', ('/conversas/' + str(message['conversation_id']), notice['id']))
             c.execute("INSERT OR IGNORE INTO message_reads(user_id,message_id) SELECT m.client_id,m.id FROM messages m WHERE m.visibility='client' AND m.read_by_client=1 AND m.sender_role!='client'")
             c.execute("INSERT OR IGNORE INTO message_reads(user_id,message_id) SELECT u.id,m.id FROM messages m JOIN users u ON u.role IN ('admin','staff') AND u.active=1 WHERE m.read_by_staff=1 AND m.sender_id IS NOT u.id")
-        if existed and current_version < 9:
+        if existed and not fresh_postgres and current_version < 9:
             c.execute("UPDATE contacts SET status='nao_classificado' WHERE status='novo'")
         c.execute('INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)', (SCHEMA_VERSION,))
         defaults = {
@@ -874,8 +910,13 @@ def team_chat_html(c, user):
         attachment = ''
         if message['attachment_stored']:
             attachment = '<a class="message-attachment" href="/admin/chat-equipe/anexo/' + str(message['id']) + '">' + panel_icon('documents') + esc(message['attachment_filename']) + '</a>'
-        side = 'office' if message['sender_id'] == user['id'] else 'client'
-        parts.append('<div class="message ' + side + ' team-message" data-avatar="' + esc(initials(message['sender_name'])) + '"><p class="message-meta">' + esc(message['sender_name']) + ' · ' + esc(message['created']) + '</p><p>' + highlight_mentions(message['body']) + '</p>' + attachment + '</div>')
+        mine = message['sender_id'] == user['id']
+        side = 'client' if mine else 'office'
+        created = esc((message['created'] or '')[:16])
+        parts.append('<div class="message ' + side + ' team-message" data-avatar="' + esc(initials(message['sender_name'])) + '">' +
+            '<span class="message-avatar" aria-hidden="true">' + esc(initials(message['sender_name'])) + '</span>' +
+            '<div class="message-body"><p class="message-meta"><strong>' + esc(message['sender_name']) + '</strong> · <time>' + created + '</time></p>' +
+            '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + attachment + '</div></div></div>')
     return ''.join(parts) or '<p class="muted">Nenhuma mensagem no chat da equipe.</p>'
 
 
@@ -1453,10 +1494,10 @@ class Handler(BaseHTTPRequestHandler):
         admin = user['role'] == 'admin'
         home = '/admin' if admin else '/advogado'
         primary = [(home, 'Visão geral' if admin else 'Meu painel', 'home'), ('/admin/clientes', 'Clientes', 'clients'), ('/admin/casos', 'Casos', 'cases')]
-        attendance = [('/admin/mensagens', 'Conversas', 'messages', str(unread) if unread else ''), ('/admin/chats', 'Chat ao vivo', 'messages', str(guest_unread) if guest_unread else ''), ('/admin/solicitacoes', 'Solicitações', 'messages'), ('/admin/atualizacoes', 'Atualizações', 'updates')]
+        attendance = [('/admin/mensagens', 'Conversas com clientes', 'messages', str(unread) if unread else ''), ('/admin/chats', 'Chat ao vivo', 'messages', str(guest_unread) if guest_unread else ''), ('/admin/solicitacoes', 'Solicitações', 'messages')]
         if is_super(user):
             attendance.append(('/admin/contatos', 'Contatos do site', 'support', str(new_contacts) if new_contacts else ''))
-        agenda_links = [('/admin/compromissos', 'Agenda', 'calendar')]
+        agenda_links = [('/admin/compromissos', 'Agenda', 'calendar'), ('/admin/atualizacoes', 'Atualizações', 'updates')]
         if can_cases:
             agenda_links += [('/admin/tarefas?status=atrasadas', 'Prazos', 'tasks'), ('/admin/tarefas', 'Tarefas', 'tasks'), ('/admin/pendencias', 'Pendências', 'tasks')]
         documents = [('/admin/arquivos', 'Documentos de clientes', 'documents')]
@@ -1484,7 +1525,7 @@ class Handler(BaseHTTPRequestHandler):
 
         nav = ''.join(link(item) for item in primary)
         nav += group('Atendimento ao cliente', 'messages', attendance)
-        internal_links = [('/admin/chat-equipe', 'Chat da equipe', 'messages', str(team_unread) if team_unread else ''), ('/admin/mensagens?tipo=interno&status=todas', 'Relatos internos dos casos', 'messages')]
+        internal_links = [('/admin/chat-equipe', 'Chat da equipe', 'messages', str(team_unread) if team_unread else ''), ('/admin/mensagens?tipo=interno&status=todas', 'Conversas internas dos casos', 'messages')]
         nav += group('Comunicação interna', 'support', internal_links)
         nav += group('Agenda e Gestão', 'calendar', agenda_links)
         nav += group('Documentos', 'documents', documents)
@@ -1728,22 +1769,39 @@ class Handler(BaseHTTPRequestHandler):
                 and (not conversation['case_id'] or self.can_access_case(c, user, conversation['case_id'])))
 
     def conversation_messages_html(self, c, user, conversation_id):
-        conversation_meta = c.execute('SELECT visibility,case_id FROM conversations WHERE id=?', (conversation_id,)).fetchone()
+        conversation_meta = c.execute('SELECT visibility,case_id,client_id FROM conversations WHERE id=?', (conversation_id,)).fetchone()
         messages = c.execute('SELECT m.*,u.name AS sender_name FROM messages m LEFT JOIN users u ON u.id=m.sender_id WHERE m.conversation_id=? ORDER BY m.id', (conversation_id,)).fetchall()
         attachment_rows = c.execute("SELECT ma.* FROM message_attachments ma JOIN messages m ON m.id=ma.message_id WHERE m.conversation_id=? ORDER BY ma.id", (conversation_id,)).fetchall()
         attachments_by_message = {}
         for attachment in attachment_rows:
             attachments_by_message.setdefault(attachment['message_id'], []).append(attachment)
+        is_internal = bool(conversation_meta and conversation_meta['visibility'] == 'internal')
         messages_html = []
         for message in messages:
-            if message['sender_id'] == user['id']:
+            mine = message['sender_id'] == user['id']
+            if mine:
                 sender = 'Você'
             elif user['role'] == 'client' and message['sender_role'] != 'client' and not message['reveal_identity']:
                 sender = 'Suporte do escritório'
             else:
                 sender = message['sender_name'] or 'Escritório'
+            side = 'client' if message['sender_role'] == 'client' else ('office' if not is_internal else 'internal')
+            if is_internal and message['sender_role'] != 'client':
+                side = 'office'
+            if is_internal and message['sender_role'] == 'client':
+                side = 'client'
             file_links = ''.join('<a class="message-attachment" href="/anexo/' + str(attachment['id']) + '">' + panel_icon('documents') + esc(attachment['filename']) + '</a>' for attachment in attachments_by_message.get(message['id'], []))
-            messages_html.append('<div class="message ' + ('client' if message['sender_role'] == 'client' else 'office') + '" data-avatar="' + esc(initials(sender)) + '"><p class="message-meta">' + esc(sender) + ' · ' + esc(message['created']) + '</p><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '</div>')
+            unread_mark = '<span class="unread-mark" title="Não lida"></span>' if not message['read_by_staff'] and user['role'] != 'client' and not mine else ''
+            created = esc((message['created'] or '')[:16])
+            task_button = ''
+            if is_internal and user['role'] in ('admin', 'staff'):
+                meta_case = conversation_meta['case_id'] if conversation_meta else ''
+                meta_client = conversation_meta['client_id'] if conversation_meta else ''
+                task_button = '<div class="message-tools"><button type="button" class="task-from-message" data-task-from-message="' + str(message['id']) + '" data-task-case="' + str(meta_case or '') + '" data-task-client="' + str(meta_client or '') + '" data-task-body="' + esc(message['body'][:200]) + '">' + panel_icon('tasks') + 'Criar tarefa a partir desta mensagem</button></div>'
+            messages_html.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
+                '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
+                '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong> · <time>' + created + '</time>' + unread_mark + '</p>' +
+                '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '</div>' + task_button + '</div></div>')
         return ''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>', messages
 
     def conversation_view_html(self, c, user, conversation_id):
@@ -2259,6 +2317,7 @@ class Handler(BaseHTTPRequestHandler):
                 can_reply = self.can_reply_conversation(c, user, conversation)
                 unread = conversation_unread(c, user, conversation_id)
             messages_html = []
+            is_internal = conversation['visibility'] == 'internal'
             for message in messages:
                 if message['sender_id'] == user['id']:
                     sender = 'Você'
@@ -2268,9 +2327,18 @@ class Handler(BaseHTTPRequestHandler):
                     sender = message['sender_name'] or 'Escritório'
                 file_links = ''.join('<a class="message-attachment" href="/anexo/' + str(attachment['id']) + '">' + panel_icon('documents') + esc(attachment['filename']) + '</a>' for attachment in attachments_by_message.get(message['id'], []))
                 task_link = ''
-                if user['role'] in ('admin', 'staff') and conversation['visibility'] == 'internal' and conversation['case_id']:
-                    task_link = '<a class="message-action" href="/admin/tarefa/nova?message_id=' + str(message['id']) + '">Criar tarefa a partir desta mensagem</a>'
-                messages_html.append('<div class="message ' + ('client' if message['sender_role'] == 'client' else 'office') + '" data-avatar="' + esc(initials(sender)) + '"><p class="message-meta">' + esc(sender) + ' · ' + esc(message['created']) + '</p><p>' + highlight_mentions(message['body']) + '</p>' + file_links + task_link + '</div>')
+                if user['role'] in ('admin', 'staff') and is_internal:
+                    task_link = '<button type="button" class="task-from-message" data-task-from-message="' + str(message['id']) + '" data-task-case="' + str(conversation['case_id'] or '') + '" data-task-client="' + str(conversation['client_id']) + '" data-task-body="' + esc(message['body'][:200]) + '">' + panel_icon('tasks') + 'Criar tarefa a partir desta mensagem</button>'
+                side = 'client' if message['sender_role'] == 'client' else ('internal' if is_internal else 'office')
+                if is_internal and message['sender_role'] == 'client':
+                    side = 'client'
+                unread_mark = '<span class="unread-mark" title="Não lida pela equipe"></span>' if not message['read_by_staff'] and user['role'] != 'client' and message['sender_id'] != user['id'] else ''
+                created = esc((message['created'] or '')[:16])
+                messages_html.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
+                    '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
+                    '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong> · <time>' + created + '</time>' + unread_mark + '</p>' +
+                    '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '</div>' +
+                    ('<div class="message-tools">' + task_link + '</div>' if task_link else '') + '</div></div>')
             hidden = '<input type="hidden" name="conversation_id" value="' + str(conversation_id) + '">'
             reply_fields = hidden + '<label>Resposta<textarea name="body" rows="4"></textarea></label><label>Anexo (opcional)<input type="file" name="file"></label><p class="muted chat-attachment-hint">Permitidos: PDF, PNG, JPG e TXT, até 10 MB.</p>'
             if user['role'] != 'client' and conversation['visibility'] == 'client':
@@ -2933,10 +3001,11 @@ class Handler(BaseHTTPRequestHandler):
             pending_link = '<p><a class="text-link" href="/admin/pendencias?case_id=' + str(case_id) + '&amp;client_id=' + str(case_row['client_id']) + '&amp;status=todas">Gerenciar pendências →</a></p>' if can_cases else ''
             internal_form = ''
             if can_message:
-                internal_form = form('/admin/mensagem', '<input type="hidden" name="client_id" value="' + str(case_row['client_id']) + '"><input type="hidden" name="case_id" value="' + str(case_id) + '"><input type="hidden" name="visibility" value="internal">' + field('Assunto interno', 'subject') + '<label>Mensagem interna<textarea name="body" rows="3" required></textarea></label>', 'Enviar comunicação interna')
-            internal_html = '<div class="conversation-list">' + conversation_cards(internal_conversations, user) + '</div><p><a class="text-link" href="/admin/mensagens?tipo=interno&case_id=' + str(case_id) + '">Abrir histórico interno →</a></p>' + internal_form
+                internal_form = form('/admin/mensagem', '<input type="hidden" name="client_id" value="' + str(case_row['client_id']) + '"><input type="hidden" name="case_id" value="' + str(case_id) + '"><input type="hidden" name="visibility" value="internal">' + field('Assunto interno', 'subject') + '<label>Mensagem interna<textarea name="body" rows="3" required></textarea></label>', 'Enviar à equipe')
+            internal_html = '<div class="case-channel case-channel-internal"><div class="case-channel-head"><span class="conversation-channel internal">Comunicação interna</span><span class="muted">Somente a equipe autorizada do caso visualiza estas mensagens.</span></div><div class="conversation-list">' + conversation_cards(internal_conversations, user) + '</div><p><a class="text-link" href="/admin/mensagens?tipo=interno&case_id=' + str(case_id) + '">Abrir histórico interno →</a></p>' + internal_form + '</div>'
+            client_channel_html = '<div class="case-channel case-channel-client"><div class="case-channel-head"><span class="conversation-channel client">Conversa com o cliente</span><span class="muted">Mensagens visíveis ao cliente na Área do Cliente.</span></div><div class="conversation-list">' + conversation_cards(client_conversations, user) + '</div></div>'
             task_items = ''.join('<li><a class="text-link" href="/admin/tarefa?task_id=' + str(task['id']) + '">' + esc(task['title']) + '</a> ' + task_status_badge(task) + task_priority_badge(task['priority']) + '</li>' for task in case_tasks) or '<li>Nenhuma tarefa vinculada.</li>'
-            content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/casos">← Casos</a><p class="eyebrow">FICHA DO ATENDIMENTO</p><h1>' + esc(case_row['title']) + '</h1>' + actions + edit + '<div class="dashboard"><div>' + card('Dados do caso', details) + card('Comunicação com o cliente', conversation_cards(client_conversations, user)) + card('Comunicação interna', internal_html) + card('Documentos', '<ul>' + document_items + '</ul>') + '</div><div>' + card('Tarefas e prazos', '<ul>' + task_items + '</ul><p><a class="text-link" href="/admin/tarefas?case_id=' + str(case_id) + '">Gerenciar tarefas →</a></p>') + card('Pendências', '<ul>' + pending_items + '</ul>' + pending_link) + card('Compromissos', '<ul>' + appointment_items + '</ul><p><a class="text-link" href="/admin/compromissos?case_id=' + str(case_id) + '">Abrir agenda →</a></p>') + card('Atualizações', '<ul>' + update_items + '</ul>') + history + '</div></div></section>'
+            content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/casos">← Casos</a><p class="eyebrow">FICHA DO ATENDIMENTO</p><h1>' + esc(case_row['title']) + '</h1>' + actions + edit + '<div class="dashboard"><div>' + card('Dados do caso', details) + card('Comunicação com o cliente', client_channel_html) + card('Comunicação interna', internal_html) + card('Documentos', '<ul>' + document_items + '</ul>') + '</div><div>' + card('Tarefas e prazos', '<ul>' + task_items + '</ul><p><a class="text-link" href="/admin/tarefas?case_id=' + str(case_id) + '">Gerenciar tarefas →</a></p>') + card('Pendências', '<ul>' + pending_items + '</ul>' + pending_link) + card('Compromissos', '<ul>' + appointment_items + '</ul><p><a class="text-link" href="/admin/compromissos?case_id=' + str(case_id) + '">Abrir agenda →</a></p>') + card('Atualizações', '<ul>' + update_items + '</ul>') + history + '</div></div></section>'
             return self.page('Histórico do caso', content, user)
         if path == '/admin/casos':
             if not user or user['role'] not in ('admin', 'staff'):
@@ -3189,16 +3258,20 @@ class Handler(BaseHTTPRequestHandler):
                 message_id = 0
             with db() as c:
                 message = c.execute("SELECT m.*,cv.visibility,cv.case_id FROM messages m JOIN conversations cv ON cv.id=m.conversation_id WHERE m.id=?", (message_id,)).fetchone()
-                if not message or message['visibility'] != 'internal' or not message['case_id'] or not has_permission(c, user, 'manage_cases'):
+                if not message or message['visibility'] != 'internal' or not has_permission(c, user, 'manage_cases'):
                     return self.forbidden()
-                if not self.can_access_case(c, user, message['case_id']):
+                if message['case_id'] and not self.can_access_case(c, user, message['case_id']):
                     return self.forbidden()
-                case_row = c.execute('SELECT * FROM cases WHERE id=? AND deleted_at=\'\'', (message['case_id'],)).fetchone()
-                if not case_row:
+                if not self.can_manage(c, user, message['client_id']):
                     return self.forbidden()
-            prefill = '<input type="hidden" name="source_message_id" value="' + str(message_id) + '"><input type="hidden" name="client_id" value="' + str(message['client_id']) + '"><input type="hidden" name="case_id" value="' + str(message['case_id']) + '"><input type="hidden" name="assigned_to" value="' + str(user['id']) + '">'
-            task_form = form('/admin/tarefa', prefill + input_field('Título', 'title', message['body'][:120]) + '<label>Descrição<textarea name="description" rows="4">' + esc(message['body']) + '</textarea></label>' + field('Prazo', 'due_at', 'datetime-local', required=False) + '<label>Prioridade<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>', 'Criar tarefa vinculada')
-            content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/conversas/' + str(message['conversation_id']) + '">← Voltar à conversa</a><p class="eyebrow">NOVA TAREFA</p><h1>Transformar mensagem em tarefa</h1><p class="muted">Caso: ' + esc(case_row['title']) + '</p>' + card('Mensagem de origem', '<p>' + highlight_mentions(message['body']) + '</p>') + card('Tarefa', task_form) + '</section>'
+                case_row = c.execute('SELECT * FROM cases WHERE id=? AND deleted_at=\'\'', (message['case_id'],)).fetchone() if message['case_id'] else None
+                staff = c.execute("SELECT id,name FROM users WHERE role IN ('staff','admin') AND active=1 AND deleted_at='' ORDER BY name").fetchall()
+                collaborators = c.execute('SELECT user_id FROM task_collaborators WHERE task_id=?', (0,)).fetchall() if False else []
+            prefill = '<input type="hidden" name="source_message_id" value="' + str(message_id) + '"><input type="hidden" name="client_id" value="' + str(message['client_id']) + '"><input type="hidden" name="case_id" value="' + str(message['case_id'] or '') + '"><input type="hidden" name="assigned_to" value="' + str(user['id']) + '">'
+            assign_options = '<option value="">Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff if user['role'] != 'staff' or row['id'] == user['id'])
+            task_form = form('/admin/tarefa', prefill + input_field('Título', 'title', message['body'][:120]) + '<label>Descrição<textarea name="description" rows="4">' + esc(message['body']) + '</textarea></label>' + field('Prazo', 'due_at', 'datetime-local', required=False) + '<label>Responsável<select name="assigned_to">' + assign_options + '</select></label><label>Prioridade<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>', 'Criar tarefa vinculada')
+            case_label = esc(case_row['title']) if case_row else 'Sem caso vinculado'
+            content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/conversas/' + str(message['conversation_id']) + '">← Voltar à conversa</a><p class="eyebrow">NOVA TAREFA</p><h1>Transformar mensagem em tarefa</h1><p class="muted">Caso: ' + case_label + '</p>' + card('Mensagem de origem', '<p>' + highlight_mentions(message['body']) + '</p>') + card('Tarefa', task_form) + '</section>'
             return self.page('Nova tarefa', content, user)
         if path == '/admin/tarefa':
             if not user or user['role'] not in ('admin', 'staff'):
@@ -3875,7 +3948,7 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as c:
                     try:
                         cursor = c.execute('INSERT INTO users(name,email,password,role,active) VALUES(?,?,?,?,1)', (name, email, pwd(password), 'client'))
-                    except sqlite3.IntegrityError:
+                    except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     account_id = cursor.lastrowid
                     sid = secrets.token_urlsafe(32)
@@ -4408,7 +4481,7 @@ class Handler(BaseHTTPRequestHandler):
                             raise ValidationError('Responsável inválido.')
                     try:
                         cursor = c.execute('INSERT INTO users(name,email,password,role,active,must_change,phone,created_by,owner_staff_id) VALUES(?,?,?,?,1,1,?,?,?)', (name, email, pwd(password), 'client', phone, user['id'], owner or None))
-                    except sqlite3.IntegrityError:
+                    except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     new_client = cursor.lastrowid
                     if owner:
@@ -4456,7 +4529,7 @@ class Handler(BaseHTTPRequestHandler):
                     before = {k: client_row[k] for k in ('name', 'email', 'phone', 'active', 'owner_staff_id')}
                     try:
                         c.execute('UPDATE users SET name=?,email=?,phone=?,active=?,owner_staff_id=? WHERE id=?', (name, email, phone, active, owner, client))
-                    except sqlite3.IntegrityError:
+                    except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     if user['role'] == 'admin':
                         if owner:
@@ -4791,7 +4864,7 @@ class Handler(BaseHTTPRequestHandler):
                     before = {k: target_row[k] for k in ('name', 'email', 'role', 'staff_kind', 'active', 'is_super')}
                     try:
                         c.execute('UPDATE users SET name=?,email=?,role=?,staff_kind=?,active=?,is_super=? WHERE id=?', (name, email, role, kind if role == 'staff' else '', active, new_super, target))
-                    except sqlite3.IntegrityError:
+                    except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     new_password = fields.get('password', '')
                     if new_password:
@@ -4816,7 +4889,7 @@ class Handler(BaseHTTPRequestHandler):
                     is_super_flag = 1 if role == 'admin' and fields.get('is_super') == '1' else 0
                     try:
                         c.execute('INSERT INTO users(name,email,password,role,staff_kind,is_super) VALUES(?,?,?,?,?,?)', (name, email, pwd(initial), role, kind if role == 'staff' else '', is_super_flag))
-                    except sqlite3.IntegrityError:
+                    except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     self.audit_action(c, user['id'], 'criar usuário', email, entity='user', after={'name': name, 'email': email, 'role': role, 'staff_kind': kind if role == 'staff' else '', 'is_super': is_super_flag})
                 elif path == '/admin/toggle':
@@ -4896,13 +4969,16 @@ class Handler(BaseHTTPRequestHandler):
                     source_message_id = to_int(fields, 'source_message_id', required=False)
                     if source_message_id:
                         source_message = c.execute("SELECT m.*,cv.visibility,cv.case_id FROM messages m JOIN conversations cv ON cv.id=m.conversation_id WHERE m.id=?", (source_message_id,)).fetchone()
-                        if not source_message or source_message['visibility'] != 'internal' or not source_message['case_id']:
+                        if not source_message or source_message['visibility'] != 'internal':
                             raise ValidationError('Mensagem de origem inválida.')
-                        if case_id and case_id != source_message['case_id']:
+                        if case_id and source_message['case_id'] and case_id != source_message['case_id']:
                             raise ValidationError('A mensagem pertence a outro caso.')
-                        case_id = source_message['case_id']
+                        if source_message['case_id']:
+                            case_id = source_message['case_id']
+                            if not self.can_access_case(c, user, case_id):
+                                return self.forbidden()
                         client = source_message['client_id']
-                        if not self.can_access_case(c, user, case_id):
+                        if not self.can_manage(c, user, client):
                             return self.forbidden()
                     document_id = to_int(fields, 'document_id', required=False)
                     if document_id:
@@ -5323,12 +5399,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.error_page('Erro interno', 'Não foi possível concluir a operação. Tente novamente.', 500, user)
 
 
+def local_network_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('8.8.8.8', 80))
+            return probe.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+
+
 def run():
     init()
-    host = os.getenv('HOST', '127.0.0.1')
+    sys.modules.setdefault('app', sys.modules[__name__])
+    from flask_app import flask_app
+    host = os.getenv('HOST', '0.0.0.0')
     port = int(os.getenv('PORT', '8080'))
-    print(f'AMBIENTE DE TESTES: http://{host}:{port}')
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    print(f'AMBIENTE DE TESTES (Flask): http://127.0.0.1:{port}')
+    print(f'Acesso na rede local: http://{local_network_ip()}:{port}')
+    print('Para liberar no Windows, execute o comando de firewall documentado no README.')
+    flask_app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 if __name__ == '__main__':

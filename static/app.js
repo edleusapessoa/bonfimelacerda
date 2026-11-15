@@ -919,3 +919,45 @@ document.querySelectorAll('.mention-chip').forEach((chip) => {
     textarea.selectionStart = textarea.selectionEnd = start + insert.length;
   });
 });
+
+// === Modal: criar tarefa a partir de mensagem interna ===
+(function () {
+  const overlay = document.createElement('div');
+  overlay.className = 'task-modal-overlay';
+  overlay.hidden = true;
+  overlay.innerHTML = '<div class="task-modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title">' +
+    '<div class="task-modal-head"><h2 id="task-modal-title">Nova tarefa</h2><button type="button" class="task-modal-close" aria-label="Fechar">×</button></div>' +
+    '<form method="post" action="/admin/tarefa" class="task-modal-form">' +
+    '<input type="hidden" name="csrf" value="">' +
+    '<input type="hidden" name="source_message_id" value="">' +
+    '<input type="hidden" name="client_id" value="">' +
+    '<input type="hidden" name="case_id" value="">' +
+    '<label>Título<input type="text" name="title" required maxlength="180"></label>' +
+    '<label>Descrição<textarea name="description" rows="3"></textarea></label>' +
+    '<label>Prazo<input type="datetime-local" name="due_at"></label>' +
+    '<label>Prioridade<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>' +
+    '<div class="task-modal-actions"><button type="submit" class="btn">Criar tarefa</button><button type="button" class="btn ghost task-modal-cancel">Cancelar</button></div>' +
+    '</form></div>';
+  document.body.appendChild(overlay);
+  const form = overlay.querySelector('form');
+  const close = () => { overlay.hidden = true; document.body.style.overflow = ''; };
+  // Delegação: sobrevive à atualização automática do histórico de mensagens.
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-task-from-message]');
+    if (!button) return;
+    const token = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+    form.querySelector('[name=csrf]').value = token;
+    form.querySelector('[name=source_message_id]').value = button.dataset.taskFromMessage;
+    form.querySelector('[name=client_id]').value = button.dataset.taskClient || '';
+    form.querySelector('[name=case_id]').value = button.dataset.taskCase || '';
+    form.querySelector('[name=title]').value = (button.dataset.taskBody || '').slice(0, 120);
+    form.querySelector('[name=description]').value = button.dataset.taskBody || '';
+    overlay.hidden = false;
+    document.body.style.overflow = 'hidden';
+    form.querySelector('[name=title]').focus();
+  });
+  overlay.querySelector('.task-modal-close').addEventListener('click', close);
+  overlay.querySelector('.task-modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !overlay.hidden) close(); });
+})();

@@ -1,26 +1,99 @@
 # Bomfim & Lacerda Advocacia — ambiente de testes
 
-Aplicação funcional local de referência, **não homologada para produção**. Site público, área individual do cliente e administração compartilham SQLite. Não usar dados reais.
+Aplicação funcional local de referência, **não homologada para produção**. Site público, área individual do cliente e administração compartilham o mesmo banco, com suporte a **SQLite local** e **PostgreSQL em produção**. Não usar dados reais.
 
 ## Iniciar
 
-Requer Python 3.12+ (somente biblioteca padrão; testado em 3.12.10). No terminal, dentro da pasta do projeto:
+Requer Python 3.12+ e Flask 3.x. No terminal, dentro da pasta do projeto:
 
 ```bash
-python create_admin.py
+python -m pip install -r requirements.txt
 python create_admin.py
 python app.py
 ```
 
+O `app.py` inicia o projeto pelo adaptador Flask (`flask_app.py`). Para usar um servidor WSGI, aponte-o para `wsgi:application`. O servidor HTTP anterior permanece apenas como compatibilidade interna da suíte de testes.
+
 Abra `http://127.0.0.1:8080`. O comando `create_admin.py` cria uma conta de **super administrador**. Execute uma vez para **Edleusa Pessoa** e outra para **Rozária Neta Bomfim Lacerda**, usando e-mails temporários (por exemplo `edleusa.admin@bomfimlacerda.test` e `rozaria.admin@bomfimlacerda.test`). As senhas são definidas na hora, com no mínimo 12 caracteres. Quando houver e-mail oficial, troque-o em **Usuários** no painel. Use somente dados fictícios.
+
+## Arquivos locais (fora do GitHub)
+
+A pasta `local_only/` reúne o que é usado apenas no desenvolvimento local: suíte de testes, referências visuais, `codigo.docx`, `run_dev.ps1`, `migrate_sqlite_to_postgres.py` e o `.env.example`. Ela está no `.gitignore` e não será enviada ao GitHub. O banco SQLite, uploads e backups em `private/` e o arquivo `.env` também são ignorados.
+
+## Banco de dados
+
+A aplicação lê o arquivo `.env` automaticamente e escolhe o banco por `DATABASE_URL`:
+
+```text
+# SQLite local, usando os dados existentes
+DATABASE_URL=sqlite:///private/app.db
+
+# PostgreSQL em produção
+DATABASE_URL=postgresql://usuario:senha@host:5432/banco?sslmode=require
+```
+
+O SQLite local continua sendo o padrão e não precisa de Docker. Se `DATABASE_URL` não existir, a aplicação usa `APP_DB` ou `private/app.db`. O mesmo código roda nos dois bancos; a camada de compatibilidade fica em `db_compat.py`.
+
+Para iniciar localmente:
+
+```powershell
+python app.py
+```
+
+Também é possível usar o atalho local:
+
+```powershell
+.\local_only\run_dev.ps1
+```
+
+Em produção, defina `DATABASE_URL` nas variáveis de ambiente do servidor com as credenciais reais do PostgreSQL. Não grave essa URL no repositório.
+
+O script de migração abaixo é opcional e serve apenas para copiar dados de um SQLite para um PostgreSQL de teste; não é necessário para iniciar em produção:
+
+```powershell
+python local_only\migrate_sqlite_to_postgres.py --replace
+```
+
+## Acesso por outro computador na rede
+
+Por padrão, o Flask agora escuta em `0.0.0.0:8080`, permitindo acesso pela rede local. Ao iniciar com `python app.py`, o terminal exibe o endereço local e o IP de rede.
+
+No outro computador, abra:
+
+```text
+http://IP-DO-COMPUTADOR:8080
+```
+
+Descubra o IPv4 no Windows com:
+
+```powershell
+Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+  Select-Object InterfaceAlias,IPAddress
+```
+
+Se a conexão não abrir, libere a porta no firewall do Windows. Execute o PowerShell **como Administrador**:
+
+```powershell
+New-NetFirewallRule -DisplayName "Bomfim Lacerda 8080" `
+  -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private
+```
+
+Os dois computadores precisam estar na mesma rede. Este é um ambiente de testes sem HTTPS; não exponha a aplicação à Internet nem use dados reais. Para alterar porta ou interface:
+
+```powershell
+$env:PORT = "8081"
+$env:HOST = "0.0.0.0"
+python app.py
+```
 
 ## Testes
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s local_only\tests -t . -v
 ```
 
-A suíte usa banco e uploads temporários, sobe o servidor em porta aleatória e cobre autenticação, permissões, casos, documentos, notificações, conversas por assunto, leitura individual, encerramento e histórico, entre outros fluxos.
+A suíte usa banco SQLite e uploads temporários, mesmo que `DATABASE_URL` esteja definida, e sobe o servidor em porta aleatória. Ela cobre autenticação, permissões, casos, documentos, notificações, conversas por assunto, leitura individual, encerramento e histórico, entre outros fluxos.
 
 ## Migrações e backup
 
@@ -118,9 +191,10 @@ Se o acesso for perdido, outro super admin pode redefinir o MFA em `/admin/usuar
 
 | Variável | Padrão | Função |
 |---|---:|---|
-| `HOST` | `127.0.0.1` | Interface de escuta |
+| `HOST` | `0.0.0.0` | Interface de escuta |
 | `PORT` | `8080` | Porta |
-| `APP_DB` | `private/app.db` | Caminho do SQLite |
+| `DATABASE_URL` | vazio | `sqlite:///...` local ou `postgresql://...` em produção; quando vazia, usa SQLite |
+| `APP_DB` | `private/app.db` | Caminho do SQLite quando `DATABASE_URL` não define outro banco |
 | `APP_UPLOADS` | `private/uploads` | Pasta privada de arquivos |
 | `PUBLIC_ORIGIN` | vazio | Origem pública para sitemap e validação de contato |
 | `EXTRA_ORIGINS` | vazio | Origens extras separadas por vírgula |
@@ -162,7 +236,7 @@ Em produção atrás de proxy HTTPS, use `COOKIE_SECURE=1`, `TRUST_PROXY=1`, `PU
 - Os textos legais são placeholders e precisam de elaboração e revisão jurídica. O checkbox de consentimento do contato/cadastro não substitui a política de privacidade.
 - Ausência de automação de consulta judicial é intencional.
 - Sem integrações pagas, sem contratação de serviços e sem hospedagem configurada.
-- A arquitetura continua monolítica e sem template engine (para preservar zero dependências). A migração para Jinja2, separação em módulos e testes de interface completos seguem recomendados antes de evoluir o produto.
+- A aplicação agora é servida por Flask, mas a lógica continua centralizada em `app.py` e o HTML ainda é gerado por strings (sem templates Jinja2). A separação em módulos e templates segue recomendada antes de evoluir o produto.
 - A verificação antivírus só ocorre se `CLAMSCAN` estiver configurado; caso contrário, os uploads passam apenas por validação de tipo/assinatura.
 - Paginação foi implementada para auditoria e contatos; listas do painel ainda usam limites fixos.
 - A lixeira e a exclusão definitiva já funcionam, mas não há política automática de retenção, anonimização programada ou restauração de backups pela interface. A exclusão definitiva é imediata e irreversível.
@@ -171,14 +245,14 @@ Em produção atrás de proxy HTTPS, use `COOKIE_SECURE=1`, `TRUST_PROXY=1`, `PU
 
 ## Arquitetura
 
-`app.py`: servidor HTTP, rotas, regras de acesso e persistência; `create_admin.py`: bootstrap de super administrador; `static/`: CSS, JS e imagens; `tests/`: suíte `unittest`; `private/`: banco, uploads e backups locais (não distribuir com dados reais). Tabelas: users, cases, case_assignments, case_events, updates, appointments, tasks, internal_documents, requests, documents, conversations, messages, message_reads, message_attachments, guest_sessions, guest_messages, pendencies, posts, faqs, contacts, audit, assignments, permissions, settings, notifications, schema_migrations.
+`app.py`: núcleo com rotas, regras de acesso, HTML e persistência; `flask_app.py`: adaptador Flask/WSGI que preserva o Handler existente; `wsgi.py`: ponto de entrada WSGI; `db_compat.py`: camada SQLite/PostgreSQL; `create_admin.py`: bootstrap de super administrador; `static/`: CSS, JS e imagens; `private/`: banco, uploads e backups locais (não distribuir com dados reais); `local_only/`: suíte `unittest`, referências visuais, scripts de desenvolvimento e migração SQLite para PostgreSQL (ignorado pelo Git). Tabelas: users, cases, case_assignments, case_events, updates, appointments, appointment_participants, tasks, task_collaborators, task_subtasks, internal_documents, requests, documents, conversations, messages, message_reads, message_attachments, message_mentions, guest_sessions, guest_messages, pendencies, posts, faqs, contacts, audit, assignments, permissions, settings, notifications, team_chat_messages, team_chat_mentions, team_chat_reads, schema_migrations.
 
 ## Antes de implantar
 
 1. Revisão de segurança, LGPD, controles de acesso e modelagem de dados por profissional responsável.
 2. Migrar para stack de produção com servidor web robusto, HTTPS, sessões persistentes seguras, rate limiting compartilhado, MFA obrigatório/WebAuthn para super admins, recuperação de senha por e-mail, monitoramento, verificação antivírus e auditoria completa.
 3. Revisar a política de acesso global aos casos, notificações por e-mail, edição/exclusão de conteúdos e documentos, política de privacidade e consentimentos.
-4. Avaliar PostgreSQL e armazenamento privado com backups criptografados, retenção e restauração testada; considerar trilha de auditoria append-only/hash chain.
+4. Avaliar armazenamento privado e backups PostgreSQL criptografados, com retenção e restauração testada; considerar trilha de auditoria append-only/hash chain.
 5. Testar com dados fictícios e validar conteúdo institucional e imagens com a equipe.
 
 ## Custos

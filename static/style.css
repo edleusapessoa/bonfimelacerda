@@ -1028,3 +1028,68 @@
 .faq-item{padding:0!important;margin:0}
 .faq-item summary{padding:14px 2px!important}
 .faq-answer{padding-bottom:14px!important}
+
+/* === Chat moderno (Bomfim & Lacerda) === */
+.thread{max-height:420px}
+.message{display:flex;gap:10px;align-items:flex-end;border:0;border-radius:14px;padding:0;background:none;font-size:14px;max-width:88%}
+.message.client{margin-left:auto;flex-direction:row-reverse}
+.message .message-body{display:flex;flex-direction:column;gap:3px;min-width:0}
+.message.client .message-body{align-items:flex-end}
+.message .bubble{border-radius:14px;padding:9px 13px;line-height:1.5;overflow-wrap:anywhere;box-shadow:0 1px 2px #1423330d}
+.message.client .bubble{background:#0d2c46;color:#fff;border-bottom-right-radius:4px}
+.message.office .bubble{background:#f1f4f7;border:1px solid #e1e8ee;border-bottom-left-radius:4px}
+.message.internal .bubble{background:#fbf5e6;border:1px solid #ead9ac;border-bottom-left-radius:4px}
+.message.internal.client .bubble{background:#f7ecd0;border-bottom-right-radius:4px}
+.message .message-meta{font-size:10.5px;color:#627080;margin:0}
+.message.client .message-meta{text-align:right}
+.message .message-meta strong{color:#805912;font-weight:700}
+.message .message-meta time{white-space:nowrap}
+.message .message-avatar{flex:0 0 auto;width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:#0d2c46;color:#e4b75e;font:700 11px 'Segoe UI',Arial,sans-serif;letter-spacing:.03em}
+.message .message-attachment{display:inline-flex;align-items:center;gap:6px;margin-top:6px;padding:7px 10px;border-radius:8px;background:#ffffffd9;border:1px solid #e1e8ee;color:#345d79;font-size:12px;font-weight:700;text-decoration:none}
+.message .message-attachment:hover{border-color:#c99a47;color:#805912}
+.message .mention{background:#f1dfb3;color:#755015;border-radius:5px;padding:0 4px;font-weight:700}
+.message .unread-mark{display:inline-block;width:7px;height:7px;border-radius:50%;background:#c99a47;margin-left:5px;vertical-align:middle}
+.conversation-thread,.team-chat-thread,.guest-thread{max-height:440px;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:12px;background:#f8fafc;border:1px solid #e6ebf0;border-radius:12px}
+.composer-row{display:flex;gap:10px;align-items:flex-end;margin-top:10px}
+.composer-row textarea{flex:1;resize:vertical;min-height:44px;max-height:140px;border-radius:10px}
+.composer-row .btn{margin:0}
+.composer-channel{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.composer-channel.client{color:#8a5a00}
+.composer-channel.internal{color:#1d4ed8}
+.composer-channel .channel-dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.conversation-channel{display:inline-flex;align-items:center;gap:6px;border-radius:20px;padding:3px 10px;font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.conversation-channel.client{background:#eaf3ea;color:#2e6b34;border:1px solid #cbe6cd}
+.conversation-channel.internal{background:#fdf3dc;color:#8a5a00;border:1px solid #ecd9a8}
+.conversation-channel.team{background:#e8f0f8;color:#1d4ed8;border:1px solid #cddff5}
+.message-tools{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.message-tools .btn{padding:7px 12px;font-size:12px}
+.message-tools .btn.ghost{background:none;border-color:#c9d3da;color:#526170}
+.task-from-message{display:inline-flex;align-items:center;gap:6px;border:0;background:none;color:#1d4ed8;font:700 12px 'Segoe UI',Arial,sans-serif;cursor:pointer;padding:4px 6px;border-radius:6px}
+.task-from-message:hover{background:#e8f0f8}
+.task-from-message svg{flex:0 0 auto}
+.mention-suggest{position:absolute;z-index:60;background:#fff;border:1px solid #dfe6ec;border-radius:10px;box-shadow:0 12px 28px #061d3222;max-height:190px;overflow:auto;min-width:210px;padding:5px}
+.mention-suggest button{display:flex;gap:8px;align-items:center;width:100%;border:0;background:none;padding:7px 9px;border-radius:7px;font:600 12.5px 'Segoe UI',Arial,sans-serif;color:#142333;cursor:pointer;text-align:left}
+.mention-suggest button:hover,.mention-suggest button:focus{background:#f7f2e8;color:#805912}
+.mention-suggest .panel-avatar{width:24px;height:24px;font-size:10px}
+
+/* Modal tarefa a partir de mensagem */
+.task-modal-overlay{position:fixed;inset:0;background:#061d32aa;display:grid;place-items:center;z-index:200;padding:16px}
+.task-modal-overlay[hidden]{display:none}
+.task-modal{background:#fff;border-radius:14px;box-shadow:0 24px 70px #061d3255;width:min(520px,100%);max-height:88vh;overflow:auto;border-top:4px solid var(--gold)}
+.task-modal-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid #e6ebf0}
+.task-modal-head h2{margin:0;font-size:17px;color:#0b2941}
+.task-modal-close{border:0;background:#f4f5f6;border-radius:8px;width:34px;height:34px;font-size:20px;line-height:1;cursor:pointer;color:#435464}
+.task-modal-close:hover{background:#e9edef}
+.task-modal-form{display:flex;flex-direction:column;gap:12px;padding:18px}
+.task-modal-form label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;font-weight:700;color:#243746}
+.task-modal-form input[type=text],.task-modal-form textarea,.task-modal-form select,.task-modal-form input[type=datetime-local]{border:1px solid #cdd5dc;border-radius:8px;padding:9px 10px;font:inherit;font-weight:400}
+.task-modal-form .check{flex-direction:row;align-items:center;gap:8px;font-weight:600}
+.task-modal-actions{display:flex;gap:10px;justify-content:flex-end;padding-top:4px}
+.task-modal-actions .btn{padding:9px 16px;font-size:13px}
+
+/* Canais de comunicação na ficha do caso */
+.case-channel{border-radius:12px;padding:12px 14px;border:1px solid #e1e8ee;background:#fbfcfd}
+.case-channel-internal{background:#fdf8ec;border-color:#ecd9a8}
+.case-channel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.case-channel-head .muted{font-size:11.5px}
+.case-channel .conversation-list{max-height:220px;overflow:auto;border-radius:8px;background:#fff;border:1px solid #eef1f4}
