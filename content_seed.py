@@ -6,6 +6,7 @@ aprovação dos advogados antes de serem publicados.
 
 AUTHOR = 'Bomfim & Lacerda Advocacia'
 
+
 CONTENT_SEED = [
     {
         'title': 'Golpe do falso advogado: saiba como se proteger',

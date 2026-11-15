@@ -163,7 +163,7 @@ def migrate_appointments_nullable(c):
     c.execute('CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status,when_at)')
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 24
 
 
 def schema_version():
@@ -227,7 +227,7 @@ CREATE TABLE IF NOT EXISTS appointment_participants(id INTEGER PRIMARY KEY,appoi
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),subject TEXT NOT NULL,body TEXT NOT NULL,response TEXT DEFAULT '',status TEXT DEFAULT 'Pendente',responded_by INTEGER REFERENCES users(id),responded_at TEXT DEFAULT '',last_activity_at TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),filename TEXT NOT NULL,stored TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL,source TEXT NOT NULL,uploaded_by INTEGER REFERENCES users(id),reviewed INTEGER NOT NULL DEFAULT 0,seen_by_client INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'aguardando_analise',analysis_notes TEXT DEFAULT '',reviewed_by INTEGER REFERENCES users(id),reviewed_at TEXT DEFAULT '',deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),sender_id INTEGER REFERENCES users(id),sender_role TEXT NOT NULL,visibility TEXT NOT NULL DEFAULT 'client',reveal_identity INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,read_by_client INTEGER NOT NULL DEFAULT 0,read_by_staff INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,title TEXT NOT NULL,slug TEXT DEFAULT '',summary TEXT DEFAULT '',category TEXT NOT NULL,body TEXT NOT NULL,cover_image TEXT DEFAULT '',author TEXT DEFAULT '',sources TEXT DEFAULT '',published INTEGER NOT NULL DEFAULT 0,published_at TEXT DEFAULT '',updated_at TEXT DEFAULT '',featured INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,title TEXT NOT NULL,slug TEXT DEFAULT '',summary TEXT DEFAULT '',category TEXT NOT NULL,body TEXT NOT NULL,cover_image TEXT DEFAULT '',cover_position TEXT DEFAULT '50% 30%',cover_fit TEXT DEFAULT 'cover',author TEXT DEFAULT '',sources TEXT DEFAULT '',published INTEGER NOT NULL DEFAULT 0,published_at TEXT DEFAULT '',updated_at TEXT DEFAULT '',featured INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS faqs(id INTEGER PRIMARY KEY,question TEXT NOT NULL,answer TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 0,category TEXT DEFAULT 'Geral',sort_order INTEGER NOT NULL DEFAULT 0,updated TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL,message TEXT NOT NULL,ip TEXT DEFAULT '',consent INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'novo',responsible_id INTEGER REFERENCES users(id) ON DELETE SET NULL,updated TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,user_id INTEGER,action TEXT NOT NULL,detail TEXT NOT NULL,ip TEXT DEFAULT '',user_agent TEXT DEFAULT '',entity TEXT DEFAULT '',entity_id INTEGER,client_id INTEGER,case_id INTEGER,before TEXT DEFAULT '',after TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -341,6 +341,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
         ensure_column(c, 'posts', 'slug', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'summary', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'cover_image', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'cover_position', "TEXT DEFAULT '50% 30%'")
+        ensure_column(c, 'posts', 'cover_fit', "TEXT DEFAULT 'cover'")
         ensure_column(c, 'posts', 'author', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'sources', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'published_at', "TEXT DEFAULT ''")
@@ -355,6 +357,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
             for row in c.execute("SELECT id,title FROM posts WHERE slug='' OR slug IS NULL").fetchall():
                 c.execute('UPDATE posts SET slug=? WHERE id=?', (post_slug(c, row['title'], row['id']), row['id']))
             seed_content_posts(c)
+
         c.execute('CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status,when_at)')
         ensure_column(c, 'cases', 'last_activity_at', "TEXT DEFAULT ''")
@@ -719,10 +722,38 @@ def render_article_sources(sources):
     return '<ul class="article-sources">' + ''.join('<li>' + esc(line) + '</li>' for line in lines) + '</ul>' if lines else ''
 
 
+def _post_value(post, key, default=''):
+    try:
+        value = post[key]
+        return default if value is None else value
+    except (KeyError, IndexError, TypeError):
+        return post.get(key, default) if hasattr(post, 'get') else default
+
+
+def safe_cover_position(value):
+    match = re.fullmatch(r'\s*(\d{1,3})%\s+(\d{1,3})%\s*', str(value or ''))
+    if not match:
+        return '50% 30%'
+    x = min(100, max(0, int(match.group(1))))
+    y = min(100, max(0, int(match.group(2))))
+    return str(x) + '% ' + str(y) + '%'
+
+
+def post_cover_url(post):
+    cover = str(_post_value(post, 'cover_image') or '')
+    if cover.startswith('/static/'):
+        return cover
+    return '/conteudo/capa/' + str(_post_value(post, 'id'))
+
+
 def post_cover_html(post, large=False):
     classes = 'content-cover' + (' content-cover-large' if large else '')
-    if post['cover_image']:
-        return '<img class="' + classes + '" src="/conteudo/capa/' + str(post['id']) + '" alt="" loading="lazy" decoding="async">'
+    cover = _post_value(post, 'cover_image')
+    if cover:
+        position = safe_cover_position(_post_value(post, 'cover_position', '50% 30%'))
+        fit = 'contain' if str(_post_value(post, 'cover_fit', 'cover')) == 'contain' else 'cover'
+        classes += ' cover-contain' if fit == 'contain' else ''
+        return '<img class="' + classes + '" src="' + esc(post_cover_url(post)) + '" alt="" loading="lazy" decoding="async" style="object-position:' + position + ';object-fit:' + fit + '">'
     tone = post_category_slug(post['category'])
     return '<div class="content-cover-fallback content-tone-' + tone + (' content-cover-large' if large else '') + '"><span>' + esc(post['category']) + '</span></div>'
 
@@ -730,7 +761,7 @@ def post_cover_html(post, large=False):
 def content_card_html(post):
     date_value = post['published_at'] or post['created']
     return ('<article class="content-card">' +
-            '<a class="content-card-cover" href="' + post_url(post) + '">' + post_cover_html(post) + '</a>' +
+            '<a class="content-card-cover' + (' content-contain' if str(_post_value(post, 'cover_fit', 'cover')) == 'contain' else '') + '" href="' + post_url(post) + '">' + post_cover_html(post) + '</a>' +
             '<div class="content-card-body"><span class="content-category">' + esc(post['category']) + '</span>' +
             '<h3><a href="' + post_url(post) + '">' + esc(post['title']) + '</a></h3>' +
             '<p>' + esc(post_excerpt(post)) + '</p>' +
@@ -1427,8 +1458,19 @@ def post_form(post=None, action='/admin/post'):
     category_options = ''.join('<option value="' + esc(name) + '"' + (' selected' if name == current_category else '') + '>' + esc(name) + '</option>' for name in categories)
     published_at = str(post.get('published_at') or '').replace(' ', 'T')[:16]
     updated_at = str(post.get('updated_at') or '').replace(' ', 'T')[:16]
-    cover_note = '<p class="muted">Capa atual: <a class="text-link" href="/conteudo/capa/' + str(post.get('id')) + '" target="_blank" rel="noopener">visualizar</a></p>' if post.get('cover_image') else '<p class="muted">Nenhuma imagem de capa enviada.</p>'
+    if post.get('cover_image'):
+        cover_href = str(post.get('cover_image')) if str(post.get('cover_image')).startswith('/static/') else '/conteudo/capa/' + str(post.get('id'))
+        cover_note = '<p class="muted">Capa atual: <a class="text-link" href="' + esc(cover_href) + '" target="_blank" rel="noopener">visualizar</a></p>'
+    else:
+        cover_note = '<p class="muted">Nenhuma imagem de capa enviada.</p>'
     hidden_id = '<input type="hidden" name="post_id" value="' + str(post.get('id')) + '">' if post.get('id') else ''
+    cover_position = safe_cover_position(post.get('cover_position') or '50% 30%')
+    pos_x, pos_y = [int(part.strip('%')) for part in cover_position.split()]
+    cover_fit = 'contain' if str(post.get('cover_fit') or 'cover') == 'contain' else 'cover'
+    cover_src = post_cover_url(post) if post.get('cover_image') else ''
+    cover_image_html = ('<img data-cover-image src="' + esc(cover_src) + '" alt="" style="object-position:' + cover_position + ';object-fit:' + cover_fit + '">' if cover_src else '<div class="cover-editor-empty" data-cover-empty>Selecione uma imagem para visualizar e reposicionar.</div>')
+    fit_options = '<option value="cover"' + (' selected' if cover_fit == 'cover' else '') + '>Preencher o banner</option><option value="contain"' + (' selected' if cover_fit == 'contain' else '') + '>Mostrar imagem inteira</option>'
+    cover_editor = ('<div class="cover-editor" data-cover-editor><div class="cover-editor-stage" data-cover-stage>' + cover_image_html + '</div><p class="cover-editor-hint">Arraste a imagem ou use os controles abaixo para escolher o enquadramento.</p><div class="cover-editor-controls"><label>Horizontal<input type="range" min="0" max="100" value="' + str(pos_x) + '" data-cover-x></label><label>Vertical<input type="range" min="0" max="100" value="' + str(pos_y) + '" data-cover-y></label><label>Enquadramento<select name="cover_fit">' + fit_options + '</select></label><input type="hidden" name="cover_position" value="' + cover_position + '" data-cover-position></div></div>')
     return ('<form method="post" action="' + esc(action) + '" enctype="multipart/form-data" class="content-admin-form">' +
             '<input type="hidden" name="csrf" value="' + CSRF_PLACEHOLDER + '">' + hidden_id +
             '<label>Título<input type="text" name="title" value="' + esc(post.get('title') or '') + '" required maxlength="180"></label>' +
@@ -1439,7 +1481,7 @@ def post_form(post=None, action='/admin/post'):
             '<label>Data de publicação<input type="datetime-local" name="published_at" value="' + esc(published_at) + '"></label>' +
             '<label>?ltima atualiza??o<input type="datetime-local" name="updated_at" value="' + esc(updated_at) + '"></label></div>' +
             '<label>Fontes e referências<textarea name="sources" rows="4" placeholder="Uma fonte por linha">' + esc(post.get('sources') or '') + '</textarea></label>' +
-            '<label>Imagem de capa<input type="file" name="cover" accept="image/png,image/jpeg,image/webp">' + cover_note + '</label>' +
+            '<label>Imagem de capa<input type="file" name="cover" accept="image/png,image/jpeg,image/webp" data-cover-file>' + cover_note + '</label>' + cover_editor +
             '<label class="check"><input type="checkbox" name="featured" value="1"' + (' checked' if post.get('featured') else '') + '> Destacar este conteúdo</label>' +
             '<div class="content-admin-actions"><button class="btn" type="submit" name="action" value="draft">Salvar rascunho</button><button class="btn dark" type="submit" name="action" value="publish">Publicar</button><button class="btn ghost" type="submit" name="action" value="preview">Visualizar</button><a class="text-link" href="/admin/conteudos">Cancelar</a></div>' +
             '</form>')
@@ -1503,12 +1545,15 @@ def post_payload(fields, files, existing=None):
         action = 'draft'
     if action == 'publish' and not published_at:
         published_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    cover_position = safe_cover_position(fields.get('cover_position', existing.get('cover_position', '50% 30%')))
+    cover_fit = 'contain' if fields.get('cover_fit') == 'contain' else 'cover'
     return {
         'title': title, 'category': category, 'summary': summary, 'body': body,
         'author': author, 'sources': sources, 'published_at': published_at,
         'published': 1 if action == 'publish' else 0,
         'featured': 1 if fields.get('featured') == '1' else 0,
         'cover_image': save_post_cover(files, existing.get('cover_image', '')),
+        'cover_position': cover_position, 'cover_fit': cover_fit,
         'updated_at': updated_at,
         'action': action,
     }
@@ -1931,7 +1976,7 @@ class Handler(BaseHTTPRequestHandler):
         bell = self.notif_bell()
         nav = self.panel_nav(user)
         chat_alert = '<div class="staff-chat-alert" id="staff-chat-alert" data-chat-alert-endpoint="/admin/chats/alertas"><a class="staff-chat-bubble" id="staff-chat-bubble" href="/admin/chats" aria-label="Abrir chat da equipe" title="Chat da equipe"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg><span class="staff-chat-badge" id="staff-chat-badge" hidden>0</span></a><div class="staff-chat-toast" id="staff-chat-toast" hidden><button type="button" class="staff-chat-toast-close" id="staff-chat-toast-close" aria-label="Fechar aviso">×</button><p class="staff-chat-toast-meta">Nova mensagem no chat</p><strong id="staff-chat-toast-name"></strong><p id="staff-chat-toast-body"></p><a id="staff-chat-toast-link" href="/admin/chats">Abrir atendimento →</a></div></div>'
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115p"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115p" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115z"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115z" defer></script></body></html>'''
 
     def chat_widget(self, user, csrf_token):
         with db() as c:
@@ -1958,7 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             nav += '<a class="nav-login" href="/entrar">Área do cliente</a>'
         widget = self.chat_widget(user, csrf_token) if not user or user['role'] == 'client' else ''
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115p"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115p" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115z"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115z" defer></script></body></html>'''
 
     def client_layout(self, title, content, user=None, description=None, csrf_token=''):
         desc = description or (str(title) + ' — Meu Espaço — Bomfim & Lacerda Advocacia.')
@@ -1978,7 +2023,7 @@ class Handler(BaseHTTPRequestHandler):
             nav.append('<a href="' + href + '"' + (' class="active" aria-current="page"' if active else '') + '>' + panel_icon(icon) + '<span>' + esc(label) + '</span>' + badge + '</a>')
         nav = ''.join(nav)
         widget = self.chat_widget(user, csrf_token)
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115p"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115p" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115z"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115z" defer></script></body></html>'''
 
     def page(self, title, content, user=None, status=200, description=None):
         data = self.session()
@@ -2626,7 +2671,7 @@ class Handler(BaseHTTPRequestHandler):
                 featured_html = ''
                 if featured:
                     featured_date = fmt_when(featured['published_at']) if featured['published_at'] else format_db_datetime(featured['created'])
-                    featured_html = '<article class="content-featured">' + '<a class="content-featured-cover" href="' + post_url(featured) + '">' + post_cover_html(featured, large=True) + '</a><div class="content-featured-copy"><span class="content-category">' + esc(featured['category']) + '</span><h2><a href="' + post_url(featured) + '">' + esc(featured['title']) + '</a></h2><p>' + esc(post_excerpt(featured)) + '</p><p class="content-meta">' + esc(featured['author'] or 'Bomfim & Lacerda Advocacia') + ' &middot; ' + esc(featured_date) + ' &middot; ' + str(max(2, (len(str(featured['body']).split()) + 219) // 220)) + ' min de leitura</p><a class="btn" href="' + post_url(featured) + '">Ler conteúdo completo</a></div></article>'
+                    featured_html = '<article class="content-featured">' + '<a class="content-featured-cover' + (' content-contain' if str(_post_value(featured, 'cover_fit', 'cover')) == 'contain' else '') + '" href="' + post_url(featured) + '">' + post_cover_html(featured, large=True) + '</a><div class="content-featured-copy"><span class="content-category">' + esc(featured['category']) + '</span><h2><a href="' + post_url(featured) + '">' + esc(featured['title']) + '</a></h2><p>' + esc(post_excerpt(featured)) + '</p><p class="content-meta">' + esc(featured['author'] or 'Bomfim & Lacerda Advocacia') + ' &middot; ' + esc(featured_date) + ' &middot; ' + str(max(2, (len(str(featured['body']).split()) + 219) // 220)) + ' min de leitura</p><a class="btn" href="' + post_url(featured) + '">Ler conteúdo completo</a></div></article>'
                 grid_posts = [post for post in posts if not featured or post['id'] != featured['id']]
                 grid_html = ''.join(content_card_html(post) for post in grid_posts)
                 empty_html = '' if grid_posts else '<p class="muted">Mais conteúdos serão publicados em breve.</p>'
@@ -5841,11 +5886,11 @@ class Handler(BaseHTTPRequestHandler):
                     with db() as c:
                         if path == '/admin/post':
                             slug = post_slug(c, payload['title'])
-                            cursor = c.execute('INSERT INTO posts(title,slug,summary,category,body,cover_image,author,sources,published,published_at,updated_at,featured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured']))
+                            cursor = c.execute('INSERT INTO posts(title,slug,summary,category,body,cover_image,cover_position,cover_fit,author,sources,published,published_at,updated_at,featured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['cover_position'], payload['cover_fit'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured']))
                             self.audit_action(c, user['id'], 'criar conteúdo', payload['title'], entity='post', entity_id=cursor.lastrowid, after={'title': payload['title'], 'category': payload['category'], 'published': payload['published'], 'published_at': payload['published_at'], 'featured': payload['featured']})
                         else:
                             slug = post_slug(c, payload['title'], post_id)
-                            c.execute('UPDATE posts SET title=?,slug=?,summary=?,category=?,body=?,cover_image=?,author=?,sources=?,published=?,published_at=?,updated_at=?,featured=? WHERE id=?', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured'], post_id))
+                            c.execute('UPDATE posts SET title=?,slug=?,summary=?,category=?,body=?,cover_image=?,cover_position=?,cover_fit=?,author=?,sources=?,published=?,published_at=?,updated_at=?,featured=? WHERE id=?', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['cover_position'], payload['cover_fit'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured'], post_id))
                             self.audit_action(c, user['id'], 'editar conteúdo', payload['title'], entity='post', entity_id=post_id, before={'title': existing['title'], 'category': existing['category'], 'published': existing['published'], 'published_at': existing['published_at'], 'featured': existing['featured']}, after={'title': payload['title'], 'category': payload['category'], 'published': payload['published'], 'published_at': payload['published_at'], 'featured': payload['featured']})
                     redirect_to = '/admin/conteudos'
                 elif path == '/admin/conteudos/status':

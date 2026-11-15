@@ -1119,3 +1119,76 @@ document.querySelectorAll('form[action="/admin/conteudos/excluir"]').forEach((fo
     if (!window.confirm('Excluir definitivamente este conte?do?')) event.preventDefault();
   });
 });
+
+document.querySelectorAll('[data-cover-editor]').forEach((editor) => {
+  const stage = editor.querySelector('[data-cover-stage]');
+  const fileInput = document.querySelector('[data-cover-file]');
+  const hidden = editor.querySelector('[data-cover-position]');
+  const rangeX = editor.querySelector('[data-cover-x]');
+  const rangeY = editor.querySelector('[data-cover-y]');
+  const fitSelect = editor.querySelector('select[name="cover_fit"]');
+  let image = editor.querySelector('[data-cover-image]');
+  if (!stage || !hidden || !rangeX || !rangeY) return;
+
+  const syncPosition = () => {
+    const position = `${rangeX.value}% ${rangeY.value}%`;
+    hidden.value = position;
+    if (image) image.style.objectPosition = position;
+  };
+  const syncFit = () => {
+    if (image && fitSelect) image.style.objectFit = fitSelect.value === 'contain' ? 'contain' : 'cover';
+  };
+  rangeX.addEventListener('input', syncPosition);
+  rangeY.addEventListener('input', syncPosition);
+  if (fitSelect) fitSelect.addEventListener('change', syncFit);
+
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  let baseX = 0;
+  let baseY = 0;
+  const clamp = (value) => Math.min(100, Math.max(0, value));
+  stage.addEventListener('pointerdown', (event) => {
+    if (!image) return;
+    event.preventDefault();
+    dragging = true;
+    startX = event.clientX;
+    startY = event.clientY;
+    baseX = Number(rangeX.value);
+    baseY = Number(rangeY.value);
+    stage.setPointerCapture(event.pointerId);
+  });
+  stage.addEventListener('pointermove', (event) => {
+    if (!dragging || !image) return;
+    const width = stage.clientWidth || 1;
+    const height = stage.clientHeight || 1;
+    rangeX.value = String(clamp(baseX - ((event.clientX - startX) / width) * 100));
+    rangeY.value = String(clamp(baseY - ((event.clientY - startY) / height) * 100));
+    syncPosition();
+  });
+  const stopDragging = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    if (event.pointerId !== undefined && stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId);
+  };
+  stage.addEventListener('pointerup', stopDragging);
+  stage.addEventListener('pointercancel', stopDragging);
+
+  if (fileInput) {
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      if (!file.type.startsWith('image/')) return;
+      const url = URL.createObjectURL(file);
+      if (!image) {
+        image = document.createElement('img');
+        image.dataset.coverImage = '1';
+        image.alt = '';
+        stage.replaceChildren(image);
+      }
+      image.src = url;
+      syncPosition();
+      syncFit();
+    });
+  }
+});
