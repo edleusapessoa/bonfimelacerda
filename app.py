@@ -209,7 +209,7 @@ def init():
             c.execute("SELECT pg_advisory_xact_lock(hashtext('bomfim_lacerda_init'))")
         else:
             c.execute('PRAGMA journal_mode=WAL')
-        c.executescript(db_compat.postgres_schema("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','staff','client')),active INTEGER NOT NULL DEFAULT 1,must_change INTEGER NOT NULL DEFAULT 0,is_super INTEGER NOT NULL DEFAULT 0,portal_enabled INTEGER NOT NULL DEFAULT 1,phone TEXT DEFAULT '',avatar TEXT DEFAULT '',cover TEXT DEFAULT '',created_by INTEGER,owner_staff_id INTEGER,deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
+        c.executescript(db_compat.postgres_schema("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','staff','client')),active INTEGER NOT NULL DEFAULT 1,must_change INTEGER NOT NULL DEFAULT 0,is_super INTEGER NOT NULL DEFAULT 0,portal_enabled INTEGER NOT NULL DEFAULT 1,phone TEXT DEFAULT '',address TEXT DEFAULT '',avatar TEXT DEFAULT '',cover TEXT DEFAULT '',created_by INTEGER,owner_staff_id INTEGER,deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS cases(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),title TEXT NOT NULL,original_title TEXT DEFAULT '',case_number TEXT DEFAULT '',area TEXT DEFAULT '',status TEXT DEFAULT 'Em andamento',description TEXT DEFAULT '',responsible_id INTEGER REFERENCES users(id),created_by INTEGER REFERENCES users(id),source TEXT DEFAULT 'interno',last_activity_at TEXT DEFAULT '',deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP,updated TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS case_assignments(id INTEGER PRIMARY KEY,case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,staff_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(case_id,staff_id));
 CREATE TABLE IF NOT EXISTS case_events(id INTEGER PRIMARY KEY,case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,actor_id INTEGER REFERENCES users(id),event_type TEXT NOT NULL,description TEXT DEFAULT '',from_status TEXT DEFAULT '',to_status TEXT DEFAULT '',old_title TEXT DEFAULT '',new_title TEXT DEFAULT '',visible_to_client INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -261,6 +261,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
         ensure_column(c, 'users', 'avatar', "TEXT DEFAULT ''")
         ensure_column(c, 'users', 'cover', "TEXT DEFAULT ''")
         ensure_column(c, 'users', 'phone', "TEXT DEFAULT ''")
+        ensure_column(c, 'users', 'address', "TEXT DEFAULT ''")
         ensure_column(c, 'users', 'created_by', 'INTEGER')
         ensure_column(c, 'users', 'owner_staff_id', 'INTEGER')
         ensure_column(c, 'users', 'deleted_at', "TEXT DEFAULT ''")
@@ -537,7 +538,71 @@ def fmt_when(value):
             return datetime.datetime.strptime(raw, pattern).strftime('%d/%m/%Y %H:%M')
         except ValueError:
             pass
-    return raw
+    try:
+        return datetime.datetime.strptime(raw, '%Y-%m-%d').strftime('%d/%m/%Y')
+    except ValueError:
+        return raw
+
+
+def appointment_when_from_fields(fields):
+    raw = str(fields.get('when_at', '') or '').strip()
+    if raw:
+        for pattern in ('%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.datetime.strptime(raw, pattern)
+            except ValueError:
+                pass
+        raise ValidationError('Data e hora inv?lidas.')
+    when_date = str(fields.get('when_date', '') or '').strip()
+    when_time = str(fields.get('when_time', '') or '').strip()
+    if not when_date:
+        raise ValidationError('Informe a data do compromisso.')
+    if not when_time:
+        raise ValidationError('Informe a hora do compromisso.')
+    try:
+        date_value = datetime.datetime.strptime(when_date, '%Y-%m-%d')
+    except ValueError:
+        raise ValidationError('Data inv?lida.')
+    for pattern in ('%H:%M', '%H:%M:%S'):
+        try:
+            time_value = datetime.datetime.strptime(when_time, pattern)
+            return date_value.replace(hour=time_value.hour, minute=time_value.minute)
+        except ValueError:
+            pass
+    raise ValidationError('Hora inv?lida.')
+
+
+def task_due_from_fields(fields):
+    legacy = str(fields.get('due_at', '') or '').strip()
+    if legacy:
+        for pattern in ('%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.datetime.strptime(legacy, pattern).strftime('%Y-%m-%d %H:%M')
+            except ValueError:
+                pass
+        try:
+            return datetime.datetime.strptime(legacy, '%Y-%m-%d').strftime('%Y-%m-%d')
+        except ValueError:
+            raise ValidationError('Prazo inválido.')
+    due_date = str(fields.get('due_date', '') or '').strip()
+    due_time = str(fields.get('due_time', '') or '').strip()
+    if not due_date:
+        if due_time:
+            raise ValidationError('Informe a data para usar a hora.')
+        return ''
+    try:
+        date_value = datetime.datetime.strptime(due_date, '%Y-%m-%d')
+    except ValueError:
+        raise ValidationError('Data inválida.')
+    if not due_time:
+        return date_value.strftime('%Y-%m-%d')
+    for pattern in ('%H:%M', '%H:%M:%S'):
+        try:
+            time_value = datetime.datetime.strptime(due_time, pattern)
+            return date_value.strftime('%Y-%m-%d') + ' ' + time_value.strftime('%H:%M')
+        except ValueError:
+            pass
+    raise ValidationError('Hora inválida.')
 
 
 def audit_json(value):
@@ -747,7 +812,10 @@ TASK_KIND_LABELS = {'compromisso': 'Compromisso', 'processo': 'Processo', 'audie
 def task_is_overdue(task):
     if task['status'] == 'concluida' or not task['due_at']:
         return False
-    return str(task['due_at'])[:16] < datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    due = str(task['due_at'])
+    if len(due) == 10:
+        return due < datetime.datetime.now().strftime('%Y-%m-%d')
+    return due[:16] < datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
 
 def task_status_badge(task):
@@ -824,7 +892,7 @@ def case_audience(c, case_row):
 
 
 def client_export(c, client_id):
-    client = c.execute("SELECT id,name,email,phone,created,active,deleted_at FROM users WHERE id=? AND role='client'", (client_id,)).fetchone()
+    client = c.execute("SELECT id,name,email,phone,address,created,active,deleted_at FROM users WHERE id=? AND role='client'", (client_id,)).fetchone()
     if not client:
         return None
     cases = [dict(row) for row in c.execute('SELECT id,title,original_title,case_number,area,status,description,source,created,updated,last_activity_at,deleted_at FROM cases WHERE client_id=? ORDER BY id', (client_id,))]
@@ -999,7 +1067,7 @@ def conversation_rows(c, user, status=None, case_id=None):
         ' AND '.join(conditions) + ' ORDER BY cv.updated DESC,cv.id DESC', tuple(params)).fetchall()
 
 
-def conversation_cards(rows, user, detail_base='/conversas/', dialog=True):
+def conversation_cards(rows, user, detail_base='/conversas/', dialog=True, return_to=''):
     statuses = {'open': 'Em andamento', 'closed': 'Encerrada', 'legacy': 'Histórico anterior'}
     parts = []
     for row in rows:
@@ -1009,7 +1077,12 @@ def conversation_cards(rows, user, detail_base='/conversas/', dialog=True):
         context += esc(row['case_title'] or 'Contato geral')
         if row['visibility'] == 'internal':
             context += ' · Relato interno'
-        parts.append('<a class="conversation-card"' + (' data-conversation-link' if dialog else '') + ' href="' + detail_base + str(row['id']) + '"><span class="conversation-card-top"><strong>' + esc(row['title']) + '</strong><span class="conversation-status">' + esc(label) + '</span></span><span class="conversation-context">' + context + '</span><span class="conversation-preview">' + esc((row['last_body'] or '')[:160]) + '</span><span class="conversation-meta">' + esc(row['updated'] or row['created']) + ' ' + unread + '</span></a>')
+        tone = {'open': 'blue', 'closed': 'green', 'legacy': 'gray'}.get(row['status'], 'gray')
+        href = detail_base + str(row['id'])
+        if return_to:
+            href += ('&' if '?' in detail_base else '?') + urllib.parse.urlencode({'return_to': return_to})
+        card_class = 'conversation-card has-unread' if row['unread'] else 'conversation-card'
+        parts.append('<a class="' + card_class + '"' + (' data-conversation-link' if dialog else '') + ' href="' + href + '"><span class="conversation-card-top"><strong>' + esc(row['title']) + '</strong><span class="conversation-status status-' + tone + '">' + esc(label) + '</span></span><span class="conversation-context">' + context + '</span><span class="conversation-preview">' + esc((row['last_body'] or '')[:160]) + '</span><span class="conversation-meta">' + esc(row['updated'] or row['created']) + ' ' + unread + '</span></a>')
     return ''.join(parts) or '<p class="muted">Nenhuma conversa nesta seção.</p>'
 
 
@@ -1134,6 +1207,20 @@ def field(label, name, typ='text', required=True):
 
 def input_field(label, name, value='', typ='text', required=True):
     return f'<label>{esc(label)}<input type="{typ}" name="{esc(name)}" value="{esc(value)}" {"required" if required else ""}></label>'
+
+
+def task_due_fields(date_value='', time_value=''):
+    return (
+        input_field('Data (opcional)', 'due_date', date_value, 'date', required=False)
+        + input_field('Hora (opcional)', 'due_time', time_value, 'time', required=False)
+    )
+
+
+def appointment_when_fields(date_value='', time_value=''):
+    return (
+        input_field('Data', 'when_date', date_value, 'date', required=True)
+        + input_field('Hora', 'when_time', time_value, 'time', required=True)
+    )
 
 
 def status_select(current):
@@ -1546,7 +1633,7 @@ class Handler(BaseHTTPRequestHandler):
         bell = self.notif_bell()
         nav = self.panel_nav(user)
         chat_alert = '<div class="staff-chat-alert" id="staff-chat-alert" data-chat-alert-endpoint="/admin/chats/alertas"><a class="staff-chat-bubble" id="staff-chat-bubble" href="/admin/chats" aria-label="Abrir chat da equipe" title="Chat da equipe"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg><span class="staff-chat-badge" id="staff-chat-badge" hidden>0</span></a><div class="staff-chat-toast" id="staff-chat-toast" hidden><button type="button" class="staff-chat-toast-close" id="staff-chat-toast-close" aria-label="Fechar aviso">×</button><p class="staff-chat-toast-meta">Nova mensagem no chat</p><strong id="staff-chat-toast-name"></strong><p id="staff-chat-toast-body"></p><a id="staff-chat-toast-link" href="/admin/chats">Abrir atendimento →</a></div></div>'
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261111r"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261111r" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115g"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261115g" defer></script></body></html>'''
 
     def chat_widget(self, user, csrf_token):
         with db() as c:
@@ -1573,7 +1660,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             nav += '<a class="nav-login" href="/entrar">Área do cliente</a>'
         widget = self.chat_widget(user, csrf_token) if not user or user['role'] == 'client' else ''
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261111r"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261111r" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261115g"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261115g" defer></script></body></html>'''
 
     def client_layout(self, title, content, user=None, description=None, csrf_token=''):
         desc = description or (str(title) + ' — Meu Espaço — Bomfim & Lacerda Advocacia.')
@@ -1593,7 +1680,7 @@ class Handler(BaseHTTPRequestHandler):
             nav.append('<a href="' + href + '"' + (' class="active" aria-current="page"' if active else '') + '>' + panel_icon(icon) + '<span>' + esc(label) + '</span>' + badge + '</a>')
         nav = ''.join(nav)
         widget = self.chat_widget(user, csrf_token)
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261111r"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261111r" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261115g"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261115g" defer></script></body></html>'''
 
     def page(self, title, content, user=None, status=200, description=None):
         data = self.session()
@@ -1804,7 +1891,7 @@ class Handler(BaseHTTPRequestHandler):
                 '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '</div>' + task_button + '</div></div>')
         return ''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>', messages
 
-    def conversation_view_html(self, c, user, conversation_id):
+    def conversation_view_html(self, c, user, conversation_id, return_to=''):
         conversation = self.conversation_access(c, user, conversation_id)
         if not conversation:
             return None
@@ -1829,7 +1916,11 @@ class Handler(BaseHTTPRequestHandler):
             context += ' · Responsável: ' + esc(conversation['responsible_name'] or 'Não atribuído')
         if conversation['visibility'] == 'internal':
             context += ' · Relato interno'
-        return '<article class="conversation-view panel" id="conversation-view" data-conversation-id="' + str(conversation_id) + '" data-conversation-endpoint="/conversas/' + str(conversation_id) + '/mensagens"><div class="conversation-view-head"><div><p class="eyebrow">' + esc(status) + '</p><h1>' + esc(conversation['title']) + '</h1><p class="muted">' + context + '</p></div></div><div class="thread conversation-thread">' + (''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>') + '</div>' + reply + close + '<div class="conversation-mark">' + mark + '</div></article>'
+        back_html = ''
+        if return_to.startswith('/') and not return_to.startswith('//'):
+            back_label = 'Voltar para a ficha do cliente' if return_to.startswith('/admin/cliente') else 'Voltar ao caso' if return_to.startswith('/admin/caso') else 'Voltar'
+            back_html = '<p class="conversation-back-link"><a class="text-link" href="' + esc(return_to) + '">' + back_label + '</a></p>'
+        return '<article class="conversation-view panel" id="conversation-view" data-conversation-id="' + str(conversation_id) + '" data-conversation-endpoint="/conversas/' + str(conversation_id) + '/mensagens">' + back_html + '<div class="conversation-view-head"><div><p class="eyebrow">' + esc(status) + '</p><h1>' + esc(conversation['title']) + '</h1><p class="muted">' + context + '</p></div></div><div class="thread conversation-thread">' + (''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>') + '</div>' + reply + close + '<div class="conversation-mark">' + mark + '</div></article>'
 
     def case_options(self, c, user, client_id=None, selected=None):
         rows = self.scoped_cases(c, user)
@@ -2268,7 +2359,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.redirect('/admin' if user['role'] != 'client' else '/cliente')
             login_fields = '<label>E-mail<input type="email" name="email" autocomplete="username" required></label><label>Senha<input type="password" name="password" autocomplete="current-password" required></label>'
             login_form = form('/entrar', login_fields, 'Acessar minha conta')
-            content = f'''<section class="login-page"><div class="wrap login-layout"><div class="login-intro"><p class="eyebrow">BOMFIM & LACERDA ADVOCACIA</p><h1>Seu espaço de acompanhamento.</h1><p>Acesse os serviços do escritório e acompanhe as informações compartilhadas com você.</p><ul class="login-benefits"><li>{ui_icon("document")}<span>Documentos e atendimentos em um só lugar</span></li><li>{ui_icon("message")}<span>Mensagens com a equipe</span></li><li>{ui_icon("updates")}<span>Atualizações e compromissos</span></li></ul></div><div class="login-panel panel"><span class="login-lock">{ui_icon("lock")}</span><p class="eyebrow">ÁREA RESTRITA</p><h2>Entrar na sua conta</h2><p class="muted">Informe seu e-mail e senha para continuar.</p>{login_form}<p class="login-register">Ainda não tem cadastro? <a class="text-link" href="/cadastro">Criar conta de cliente</a></p><p class="muted login-help">Recuperação de senha: solicite ao administrador. Envio por e-mail ainda não configurado.</p><div class="notice">Ambiente de testes: utilize apenas dados fictícios.</div></div></div></section>'''
+            content = f'''<section class="login-page"><div class="wrap login-layout"><div class="login-intro"><p class="eyebrow">BOMFIM & LACERDA ADVOCACIA</p><h1>Seu espaço de acompanhamento.</h1><p>Acesse os serviços do escritório e acompanhe as informações compartilhadas com você.</p><ul class="login-benefits"><li>{ui_icon("document")}<span>Documentos e atendimentos em um só lugar</span></li><li>{ui_icon("message")}<span>Mensagens com a equipe</span></li><li>{ui_icon("updates")}<span>Atualizações e compromissos</span></li></ul></div><div class="login-panel panel"><span class="login-lock">{ui_icon("lock")}</span><p class="eyebrow">ÁREA RESTRITA</p><h2>Entrar na sua conta</h2><p class="muted">Informe seu e-mail e senha para continuar.</p>{login_form}<p class="login-register">Ainda não tem cadastro? <a class="text-link" href="/cadastro">Criar conta de cliente</a></p><p class="muted login-help">Recuperação de senha: solicite ao administrador. Envio por e-mail ainda não configurado.</p></div></div></section>'''
             return self.page('Acesso restrito', content, user)
         if path == '/cadastro':
             if user:
@@ -2305,6 +2396,10 @@ class Handler(BaseHTTPRequestHandler):
             if not user:
                 return self.forbidden()
             conversation_id = int(path.rsplit('/', 1)[-1])
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return_to = query.get('return_to', [''])[0]
+            if not (return_to.startswith('/') and not return_to.startswith('//')):
+                return_to = ''
             with db() as c:
                 conversation = self.conversation_access(c, user, conversation_id)
                 if not conversation:
@@ -2352,14 +2447,16 @@ class Handler(BaseHTTPRequestHandler):
             last_shown_id = messages[-1]['id'] if messages else 0
             mark = form('/conversas/ler', hidden + '<input type="hidden" name="last_message_id" value="' + str(last_shown_id) + '">', 'Marcar como lida')
             status = {'open': 'Em andamento', 'closed': 'Encerrada', 'legacy': 'Histórico anterior'}[conversation['status']]
-            back = '/cliente/mensagens' if user['role'] == 'client' else '/admin/mensagens'
+            back = return_to or ('/cliente/mensagens' if user['role'] == 'client' else '/admin/mensagens')
+            back_label = 'Voltar para a ficha do cliente' if back.startswith('/admin/cliente') else 'Voltar ao caso' if back.startswith('/admin/caso') else 'Voltar as conversas'
+            view_back = '<p class="conversation-back-link"><a class="text-link" href="' + esc(back) + '">' + back_label + '</a></p>'
             context = (esc(conversation['client_name']) + ' · ') if user['role'] != 'client' else ''
             context += esc(conversation['case_title'] or 'Contato geral')
             if user['role'] != 'client' and conversation['case_id']:
                 context += ' · Responsável: ' + esc(conversation['responsible_name'] or 'Não atribuído')
             if conversation['visibility'] == 'internal':
                 context += ' · Relato interno'
-            body = '<section class="wrap section"><a class="text-link" href="' + back + '">← Voltar às conversas</a><article class="conversation-view panel" id="conversation-view" data-conversation-id="' + str(conversation_id) + '" data-conversation-endpoint="/conversas/' + str(conversation_id) + '/mensagens"><p class="eyebrow">' + esc(status) + '</p><h1>' + esc(conversation['title']) + '</h1><p class="muted">' + context + '</p><div class="thread conversation-thread">' + (''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>') + '</div>' + reply + close + '<div class="conversation-mark">' + mark + '</div></article></section>'
+            body = '<section class="wrap section"><a class="text-link" href="' + back + '">' + back_label + '</a><article class="conversation-view panel" id="conversation-view" data-conversation-id="' + str(conversation_id) + '" data-conversation-endpoint="/conversas/' + str(conversation_id) + '/mensagens">' + view_back + '<p class="eyebrow">' + esc(status) + '</p><h1>' + esc(conversation['title']) + '</h1><p class="muted">' + context + '</p><div class="thread conversation-thread">' + (''.join(messages_html) or '<p class="muted">Nenhuma mensagem.</p>') + '</div>' + reply + close + '<div class="conversation-mark">' + mark + '</div></article></section>'
             return self.page('Conversa', body, user)
         if path == '/perfil':
             if not user:
@@ -2411,7 +2508,7 @@ class Handler(BaseHTTPRequestHandler):
             app_html = ''.join('<li><strong>' + esc(fmt_when(app['when_at'])) + '</strong> — ' + esc(app['title']) + ' — ' + esc(app['notes']) + '</li>' for app in case_apps) or '<li>Nenhum compromisso.</li>'
             req_html = ''.join(card(req['subject'], '<p>' + esc(req['body']) + '</p>' + status_badge(req['status']) + '<p>' + esc(req['response']) + '</p>') for req in case_reqs) or '<p>Nenhuma solicitação.</p>'
             detail = '<p><strong>Status:</strong> ' + status_badge(case_row['status']) + '</p><p><strong>Assunto informado:</strong> ' + esc(case_row['original_title'] or case_row['title']) + '</p><p><strong>Criado em:</strong> ' + esc(case_row['created']) + '</p><p>' + esc(case_row['description']) + '</p>'
-            content = '<section class="wrap section"><p class="eyebrow">MEU ATENDIMENTO</p><h1>' + esc(case_row['title']) + '</h1>' + card('Resumo', detail) + card('Conversas', conversation_cards(case_conversations, user) + '<p><a class="text-link" href="/cliente/mensagens?case_id=' + str(case_id) + '">Iniciar novo assunto →</a></p>') + card('Documentos', '<ul>' + doc_html + '</ul>') + card('Atualizações', update_html) + card('Compromissos', '<ul>' + app_html + '</ul>') + card('Solicitações', req_html) + card('Histórico', event_html) + '<p><a class="text-link" href="/cliente/atendimentos">Voltar aos atendimentos</a></p></section>'
+            content = '<section class="wrap section"><p class="eyebrow">MEU ATENDIMENTO</p><h1>' + esc(case_row['title']) + '</h1>' + card('Resumo', detail) + card('Conversas', conversation_cards(case_conversations, user, return_to='/cliente/atendimento/' + str(case_id)) + '<p><a class="text-link" href="/cliente/mensagens?case_id=' + str(case_id) + '">Iniciar novo assunto →</a></p>') + card('Documentos', '<ul>' + doc_html + '</ul>') + card('Atualizações', update_html) + card('Compromissos', '<ul>' + app_html + '</ul>') + card('Solicitações', req_html) + card('Histórico', event_html) + '<p><a class="text-link" href="/cliente/atendimentos">Voltar aos atendimentos</a></p></section>'
             return self.page('Meu atendimento', content, user)
         if path == '/cliente/atendimentos':
             if not user or user['role'] != 'client':
@@ -2676,7 +2773,8 @@ class Handler(BaseHTTPRequestHandler):
                 fields = '<input type="hidden" name="contact_id" value="' + str(row['id']) + '"><label>Situação<select name="status">' + status_options + '</select></label><label>Responsável<select name="responsible_id">' + staff_options + '</select></label>'
                 email_url = 'mailto:' + urllib.parse.quote(row['email'], safe='@.+-_') + '?subject=' + urllib.parse.quote('Retorno - Bomfim & Lacerda')
                 chat_link = ('<a class="btn" href="/admin/atendimento-visitante?guest_id=' + str(row['guest_id']) + '">Abrir conversa e responder</a> ' if row['guest_id'] else '')
-                items.append('<article class="case-box contact-queue"><h3>' + esc(row['name']) + ' <span class="contact-state">' + esc(statuses.get(row['status'], 'Não classificado')) + '</span></h3><p class="case-meta">' + esc(row['email']) + ' · ' + esc(row['created']) + ' · Responsável: ' + esc(row['responsible_name'] or 'Não atribuído') + '</p><p>' + esc(row['message']) + '</p><div class="quick-actions">' + chat_link + '<a class="text-link" href="' + esc(email_url) + '">Abrir resposta por e-mail →</a></div><details class="admin-secondary"><summary>Atualizar acompanhamento</summary>' + form('/admin/contato/status', fields, 'Salvar acompanhamento') + '</details></article>')
+                contact_tone = {'novo': 'red', 'em_atendimento': 'blue', 'respondido': 'green', 'nao_classificado': 'gray'}.get(row['status'], 'gray')
+                items.append('<article class="case-box contact-queue status-border-' + contact_tone + '"><h3>' + esc(row['name']) + ' <span class="contact-state contact-state-' + esc(row['status']) + '">' + esc(statuses.get(row['status'], 'Não classificado')) + '</span></h3><p class="case-meta">' + esc(row['email']) + ' · ' + esc(row['created']) + ' · Responsável: ' + esc(row['responsible_name'] or 'Não atribuído') + '</p><p>' + esc(row['message']) + '</p><div class="quick-actions">' + chat_link + '<a class="text-link" href="' + esc(email_url) + '">Abrir resposta por e-mail →</a></div><details class="admin-secondary"><summary>Atualizar acompanhamento</summary>' + form('/admin/contato/status', fields, 'Salvar acompanhamento') + '</details></article>')
             status_options = ''.join('<option value="' + key + '"' + (' selected' if state == key else '') + '>' + label + '</option>' for key, label in [('ativos', 'Em aberto'), ('todos', 'Todos')] + list(statuses.items()))
             filters = '<form method="get" action="/admin/contatos" class="admin-filters"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Nome, e-mail ou mensagem"></label><label>Situação<select name="status">' + status_options + '</select></label><button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/contatos">Limpar</a></form>'
             body = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<h1>Mensagens de contato</h1><p class="muted">A fila e seus responsáveis são restritos aos super administradores. Abra a conversa para responder pelo próprio sistema; o e-mail continua disponível como alternativa.</p>' + filters + '<p class="muted">' + str(total) + ' contato(s) encontrado(s).</p>' + (''.join(items) or '<p>Nenhuma mensagem encontrada.</p>') + pagination + '</section>'
@@ -2739,7 +2837,9 @@ class Handler(BaseHTTPRequestHandler):
             for session in sessions:
                 kind = 'Cliente logado' if session['user_id'] else 'Visitante'
                 unread = ' <span class="conversation-unread">' + str(session['unread']) + ' nova(s)</span>' if session['unread'] else ''
-                items.append('<a class="conversation-card" href="/admin/atendimento-visitante?guest_id=' + str(session['id']) + '"><span class="conversation-card-top"><strong>' + esc(session['name']) + '</strong><span class="conversation-status">' + ('Em atendimento' if session['status'] == 'open' else 'Encerrado') + '</span></span><span class="conversation-context">' + esc(kind) + ' · ' + esc(session['email']) + ((' · ' + esc(session['contact_name'])) if session['contact_name'] else '') + '</span><span class="conversation-preview">' + esc((session['last_body'] or 'Sem mensagens ainda.')[:160]) + '</span><span class="conversation-meta">' + esc(session['last_message'] or session['created']) + unread + '</span></a>')
+                tone = 'blue' if session['status'] == 'open' else 'green'
+                card_class = 'conversation-card has-unread' if session['unread'] else 'conversation-card'
+                items.append('<a class="' + card_class + '" href="/admin/atendimento-visitante?guest_id=' + str(session['id']) + '"><span class="conversation-card-top"><strong>' + esc(session['name']) + '</strong><span class="conversation-status status-' + tone + '">' + ('Em atendimento' if session['status'] == 'open' else 'Encerrado') + '</span></span><span class="conversation-context">' + esc(kind) + ' · ' + esc(session['email']) + ((' · ' + esc(session['contact_name'])) if session['contact_name'] else '') + '</span><span class="conversation-preview">' + esc((session['last_body'] or 'Sem mensagens ainda.')[:160]) + '</span><span class="conversation-meta">' + esc(session['last_message'] or session['created']) + unread + '</span></a>')
             options = ''.join('<option value="' + value + '"' + (' selected' if state == value else '') + '>' + label + '</option>' for value, label in (('abertos', 'Em aberto'), ('encerrados', 'Encerrados'), ('todos', 'Todos')))
             filters = '<form method="get" action="/admin/chats" class="admin-filters"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Nome, e-mail ou mensagem"></label><label>Situação<select name="status">' + options + '</select></label><button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/chats">Limpar</a></form>'
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<p class="eyebrow">CHAT AO VIVO</p><h1>Atendimentos do chat</h1><p class="muted">Conversas de clientes logados e visitantes. A atualização da página de atendimento é automática.</p>' + filters + '<p class="muted">' + str(total) + ' atendimento(s) encontrado(s).</p><div class="conversation-list" data-admin-chat-list>' + (''.join(items) or '<p class="muted">Nenhum atendimento encontrado.</p>') + '</div>' + pagination + '</section>'
@@ -2811,7 +2911,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.forbidden()
             client_id = int(raw_id)
             with db() as c:
-                client = c.execute("SELECT u.id,u.name,u.email,u.phone,u.active,u.portal_enabled,u.owner_staff_id,owner.name AS owner_name FROM users u LEFT JOIN users owner ON owner.id=u.owner_staff_id WHERE u.id=? AND u.role='client' AND u.deleted_at=''", (client_id,)).fetchone()
+                client = c.execute("SELECT u.id,u.name,u.email,u.phone,u.address,u.active,u.portal_enabled,u.owner_staff_id,owner.name AS owner_name FROM users u LEFT JOIN users owner ON owner.id=u.owner_staff_id WHERE u.id=? AND u.role='client' AND u.deleted_at=''", (client_id,)).fetchone()
                 if not client:
                     return self.forbidden()
                 cases = [row for row in self.visible_cases(c, user) if row['client_id'] == client_id]
@@ -2827,7 +2927,7 @@ class Handler(BaseHTTPRequestHandler):
                 apps = c.execute("SELECT title,when_at,case_id FROM appointments WHERE client_id=? AND privacy='client' AND status='pendente' AND deleted_at='' AND replace(when_at,'T',' ')>=? AND (case_id IS NULL OR case_id IN (SELECT id FROM cases WHERE deleted_at='')) AND (case_id IS NOT NULL OR ?=1) ORDER BY replace(when_at,'T',' ') LIMIT 5", (client_id, datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), int(manageable))).fetchall()
             case_items = ''.join('<li><a class="text-link" href="/admin/caso/historico?case_id=' + str(row['id']) + '">' + esc(row['title']) + '</a> · ' + status_badge(row['status']) + '</li>' for row in cases) or '<li>Nenhum atendimento.</li>'
             portal_html = ('<p><strong>Portal:</strong> acesso habilitado · <a class="text-link" href="mailto:' + esc(client['email']) + '">' + esc(client['email']) + '</a></p>' if client['portal_enabled'] else '<p><strong>Portal:</strong> sem acesso ao portal.</p>')
-            details = portal_html + '<p><strong>Telefone:</strong> ' + esc(client['phone'] or 'Não informado') + '</p><p><strong>Responsável principal:</strong> ' + esc(client['owner_name'] or 'Não atribuído') + '</p><p><strong>Equipe vinculada:</strong> ' + esc(', '.join(row['name'] for row in team) or 'Nenhuma') + '</p>'
+            details = portal_html + '<p><strong>Telefone:</strong> ' + esc(client['phone'] or 'Não informado') + '</p><p><strong>Endere\u00e7o:</strong> ' + esc(client['address'] or 'N\u00e3o informado') + '</p><p><strong>Responsável principal:</strong> ' + esc(client['owner_name'] or 'Não atribuído') + '</p><p><strong>Equipe vinculada:</strong> ' + esc(', '.join(row['name'] for row in team) or 'Nenhuma') + '</p>'
             if not client['portal_enabled'] and manageable:
                 details += '<details class="admin-secondary"><summary>Habilitar acesso ao portal</summary><p class="muted">Valide a identidade do cliente antes de habilitar. O e-mail não pode estar em outra conta.</p>' + form('/admin/cliente/portal', '<input type="hidden" name="client_id" value="' + str(client_id) + '">' + field('E-mail de acesso', 'email', 'email') + field('Senha inicial', 'password', 'password') + field('Confirmar senha', 'confirm', 'password'), 'Habilitar acesso') + '</details>'
             if is_super(user) or user['role'] == 'admin':
@@ -2845,7 +2945,7 @@ class Handler(BaseHTTPRequestHandler):
             if can_cases:
                 status_choices = ''.join('<option>' + status + '</option>' for status in ('Em andamento', 'Aguardando cliente', 'Concluído', 'Informativo', 'Suspenso'))
                 new_case = '<details class="conversation-new"><summary>Cadastrar novo caso para este cliente</summary>' + form('/admin/caso', '<input type="hidden" name="client_id" value="' + str(client_id) + '"><input type="hidden" name="return_to" value="' + esc(admin_context_return(client_id=client_id)) + '">' + field('Título do caso', 'title') + field('Número do processo', 'case_number', required=False) + field('Área', 'area', required=False) + '<label>Status<select name="status">' + status_choices + '</select></label><label>Descrição<textarea name="description"></textarea></label>', 'Cadastrar caso') + '</details>'
-            content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/clientes">← Clientes</a><p class="eyebrow">FICHA DO CLIENTE</p><h1>' + esc(client['name']) + '</h1>' + actions + new_case + '<div class="dashboard"><div>' + card('Atendimentos', '<ul>' + case_items + '</ul>') + card('Conversas', conversation_cards(conversations[:5], user) + '<p><a class="text-link" href="/admin/mensagens?client_id=' + str(client_id) + '">Ver conversas do cliente →</a></p>') + card('Documentos recentes', '<ul>' + doc_items + '</ul>') + '</div><div>' + card('Contato e equipe', details) + card('Pendências', '<ul>' + pending_items + '</ul>') + card('Próximos compromissos', '<ul>' + app_items + '</ul>') + '</div></div></section>'
+            content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/clientes">← Clientes</a><p class="eyebrow">FICHA DO CLIENTE</p><h1>' + esc(client['name']) + '</h1>' + actions + new_case + '<div class="dashboard"><div>' + card('Atendimentos', '<ul>' + case_items + '</ul>') + card('Conversas', conversation_cards(conversations[:5], user, return_to='/admin/cliente?client_id=' + str(client_id)) + '<p><a class="text-link" href="/admin/mensagens?client_id=' + str(client_id) + '">Ver conversas do cliente →</a></p>') + card('Documentos recentes', '<ul>' + doc_items + '</ul>') + '</div><div>' + card('Contato e equipe', details) + card('Pendências', '<ul>' + pending_items + '</ul>') + card('Próximos compromissos', '<ul>' + app_items + '</ul>') + '</div></div></section>'
             return self.page('Ficha do cliente', content, user)
         if path == '/admin/clientes':
             if not user or user['role'] not in ('admin', 'staff'):
@@ -2875,8 +2975,8 @@ class Handler(BaseHTTPRequestHandler):
                 create_owner = '<label>Responsável<select name="owner_staff_id"><option value="">Sem responsável</option>' + owner_options + '</select></label>'
             else:
                 create_owner = f'<input type="hidden" name="owner_staff_id" value="{user["id"]}">'
-            create_form = form('/admin/cliente', field('Nome', 'name') + field('E-mail', 'email', 'email') + field('Telefone', 'phone', required=False) + field('Senha inicial', 'password', 'password') + field('Confirmar senha', 'confirm', 'password') + create_owner, 'Cadastrar cliente')
-            internal_form = form('/admin/cliente/interno', field('Nome', 'name') + field('Telefone', 'phone', required=False) + create_owner, 'Cadastrar cliente interno')
+            create_form = form('/admin/cliente', field('Nome', 'name') + field('E-mail', 'email', 'email') + field('Telefone', 'phone', required=False) + field('Endere\u00e7o (opcional)', 'address', required=False) + field('Senha inicial', 'password', 'password') + field('Confirmar senha', 'confirm', 'password') + create_owner, 'Cadastrar cliente')
+            internal_form = form('/admin/cliente/interno', field('Nome', 'name') + field('E-mail (opcional)', 'email', 'email', required=False) + field('Telefone', 'phone', required=False) + field('Endere\u00e7o (opcional)', 'address', required=False) + create_owner, 'Cadastrar cliente interno')
             blocks = []
             for x in clients:
                 owner = owner_names.get(x['owner_staff_id'], '')
@@ -2888,7 +2988,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     owner_field = ''
                     email_input = ('<p class="case-meta">E-mail: ' + esc(x['email']) + '</p>') if portal_enabled else '<p class="case-meta">Sem acesso ao portal.</p>'
-                edit_fields = f'<input type="hidden" name="client_id" value="{x["id"]}">' + input_field('Nome', 'name', x['name']) + email_input + input_field('Telefone', 'phone', x['phone'], required=False) + '<label class="check"><input type="checkbox" name="active" value="1"' + (' checked' if x['active'] else '') + '> Ativo</label>' + owner_field + input_field('Nova senha (opcional)', 'password', '', 'password', required=False)
+                edit_fields = f'<input type="hidden" name="client_id" value="{x["id"]}">' + input_field('Nome', 'name', x['name']) + email_input + input_field('Telefone', 'phone', x['phone'], required=False) + input_field('Endere\u00e7o (opcional)', 'address', x['address'], required=False) + '<label class="check"><input type="checkbox" name="active" value="1"' + (' checked' if x['active'] else '') + '> Ativo</label>' + owner_field + input_field('Nova senha (opcional)', 'password', '', 'password', required=False)
                 lgpd_link = ('<p><a class="text-link" href="/admin/cliente/exportar?client_id=' + str(x['id']) + '">Exportar dados do titular (JSON)</a></p>') if is_super(user) else ''
                 edit = '<details class="conversation-new"><summary>Editar cadastro</summary>' + form('/admin/cliente/editar', edit_fields, 'Salvar alterações') + lgpd_link + (form('/admin/delete', '<input type="hidden" name="entity" value="client"><input type="hidden" name="record_id" value="' + str(x['id']) + '">', 'Mover para lixeira') if is_super(user) else '') + '</details>' if can_create and x['id'] in editable_clients else ''
                 blocks.append('<div class="case-box"><h3>' + esc(x['name']) + '</h3><p class="case-meta">' + (esc(x['email']) if portal_enabled else 'Sem acesso ao portal') + ' · ' + ('Ativo' if x['active'] else 'Inativo') + (' · responsável: ' + esc(owner) if owner else '') + '</p><p><a class="text-link" href="/admin/cliente?client_id=' + str(x['id']) + '">Abrir ficha do cliente →</a></p>' + edit + '</div>')
@@ -3002,8 +3102,8 @@ class Handler(BaseHTTPRequestHandler):
             internal_form = ''
             if can_message:
                 internal_form = form('/admin/mensagem', '<input type="hidden" name="client_id" value="' + str(case_row['client_id']) + '"><input type="hidden" name="case_id" value="' + str(case_id) + '"><input type="hidden" name="visibility" value="internal">' + field('Assunto interno', 'subject') + '<label>Mensagem interna<textarea name="body" rows="3" required></textarea></label>', 'Enviar à equipe')
-            internal_html = '<div class="case-channel case-channel-internal"><div class="case-channel-head"><span class="conversation-channel internal">Comunicação interna</span><span class="muted">Somente a equipe autorizada do caso visualiza estas mensagens.</span></div><div class="conversation-list">' + conversation_cards(internal_conversations, user) + '</div><p><a class="text-link" href="/admin/mensagens?tipo=interno&case_id=' + str(case_id) + '">Abrir histórico interno →</a></p>' + internal_form + '</div>'
-            client_channel_html = '<div class="case-channel case-channel-client"><div class="case-channel-head"><span class="conversation-channel client">Conversa com o cliente</span><span class="muted">Mensagens visíveis ao cliente na Área do Cliente.</span></div><div class="conversation-list">' + conversation_cards(client_conversations, user) + '</div></div>'
+            internal_html = '<div class="case-channel case-channel-internal"><div class="case-channel-head"><span class="conversation-channel internal">Comunicação interna</span><span class="muted">Somente a equipe autorizada do caso visualiza estas mensagens.</span></div><div class="conversation-list">' + conversation_cards(internal_conversations, user, return_to='/admin/caso?case_id=' + str(case_id)) + '</div><p><a class="text-link" href="/admin/mensagens?tipo=interno&case_id=' + str(case_id) + '">Abrir histórico interno →</a></p>' + internal_form + '</div>'
+            client_channel_html = '<div class="case-channel case-channel-client"><div class="case-channel-head"><span class="conversation-channel client">Conversa com o cliente</span><span class="muted">Mensagens visíveis ao cliente na Área do Cliente.</span></div><div class="conversation-list">' + conversation_cards(client_conversations, user, return_to='/admin/caso?case_id=' + str(case_id)) + '</div></div>'
             task_items = ''.join('<li><a class="text-link" href="/admin/tarefa?task_id=' + str(task['id']) + '">' + esc(task['title']) + '</a> ' + task_status_badge(task) + task_priority_badge(task['priority']) + '</li>' for task in case_tasks) or '<li>Nenhuma tarefa vinculada.</li>'
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/admin/casos">← Casos</a><p class="eyebrow">FICHA DO ATENDIMENTO</p><h1>' + esc(case_row['title']) + '</h1>' + actions + edit + '<div class="dashboard"><div>' + card('Dados do caso', details) + card('Comunicação com o cliente', client_channel_html) + card('Comunicação interna', internal_html) + card('Documentos', '<ul>' + document_items + '</ul>') + '</div><div>' + card('Tarefas e prazos', '<ul>' + task_items + '</ul><p><a class="text-link" href="/admin/tarefas?case_id=' + str(case_id) + '">Gerenciar tarefas →</a></p>') + card('Pendências', '<ul>' + pending_items + '</ul>' + pending_link) + card('Compromissos', '<ul>' + appointment_items + '</ul><p><a class="text-link" href="/admin/compromissos?case_id=' + str(case_id) + '">Abrir agenda →</a></p>') + card('Atualizações', '<ul>' + update_items + '</ul>') + history + '</div></div></section>'
             return self.page('Histórico do caso', content, user)
@@ -3056,7 +3156,7 @@ class Handler(BaseHTTPRequestHandler):
                 edit_fields = f'<input type="hidden" name="case_id" value="{x["id"]}">' + input_field('Título do caso', 'title', x['title']) + input_field('Número do processo', 'case_number', x['case_number'], required=False) + input_field('Área', 'area', x['area'], required=False) + '<label>Status<select name="status">' + case_status_select + '</select></label><label>Descrição<textarea name="description">' + esc(x['description']) + '</textarea></label>' + responsible_field
                 edit_html = '<details class="conversation-new"><summary>Editar caso</summary>' + form('/admin/caso/editar', edit_fields, 'Salvar alterações') + '</details>' if x['id'] in editable_ids else '<p class="muted">Consulta disponível; alterações restritas ao responsável.</p>'
                 trash = '<details class="admin-secondary"><summary>Mais ações</summary>' + form('/admin/delete', '<input type="hidden" name="entity" value="case"><input type="hidden" name="record_id" value="' + str(x['id']) + '">', 'Mover para lixeira') + '</details>' if is_super(user) else ''
-                blocks.append('<div class="' + status_box_class('case-box', x['status'], x['last_activity_at'] or x['created'], stale_hours) + '"><h3>#' + str(x['id']) + ' — ' + esc(x['title']) + '</h3><p class="case-meta">' + esc(x['client_name']) + ' · ' + status_badge(x['status']) + ' · atualizado em ' + esc(x['updated'] or x['created']) + '</p>' + ('' if x['responsible_id'] else '<p><span class="status-badge status-yellow">Sem responsável</span></p>') + '<p><a class="text-link" href="/admin/caso/historico?case_id=' + str(x['id']) + '">Abrir ficha do atendimento →</a></p>' + edit_html + trash + '</div>')
+                blocks.append('<div class="' + status_box_class('case-box', x['status'], x['last_activity_at'] or x['created'], stale_hours) + '"><h3>#' + str(x['id']) + ' — ' + esc(x['title']) + '</h3><p class="case-meta"><strong class="case-client-name">' + esc(x['client_name']) + '</strong> · ' + status_badge(x['status']) + ' · atualizado em ' + esc(x['updated'] or x['created']) + '</p>' + ('' if x['responsible_id'] else '<p><span class="status-badge status-yellow">Sem responsável</span></p>') + '<p><a class="text-link" href="/admin/caso/historico?case_id=' + str(x['id']) + '">Abrir ficha do atendimento →</a></p>' + edit_html + trash + '</div>')
             create_html = '<details class="conversation-new"><summary>Criar caso</summary>' + create_form + '</details>' if clients and can_edit_cases else ''
             status_filter = '<option value="">Todos</option>' + ''.join('<option value="' + esc(value) + '"' + (' selected' if case_status == value else '') + '>' + esc(value) + '</option>' for value in statuses)
             owner_filter = '<option value="">Todos</option><option value="sem"' + (' selected' if responsible == 'sem' else '') + '>Sem responsável</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if responsible == str(row['id']) else '') + '>' + esc(row['name']) + '</option>' for row in staff_only if row['active'] and not row['deleted_at'])
@@ -3268,8 +3368,8 @@ class Handler(BaseHTTPRequestHandler):
                 staff = c.execute("SELECT id,name FROM users WHERE role IN ('staff','admin') AND active=1 AND deleted_at='' ORDER BY name").fetchall()
                 collaborators = c.execute('SELECT user_id FROM task_collaborators WHERE task_id=?', (0,)).fetchall() if False else []
             prefill = '<input type="hidden" name="source_message_id" value="' + str(message_id) + '"><input type="hidden" name="client_id" value="' + str(message['client_id']) + '"><input type="hidden" name="case_id" value="' + str(message['case_id'] or '') + '"><input type="hidden" name="assigned_to" value="' + str(user['id']) + '">'
-            assign_options = '<option value="">Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff if user['role'] != 'staff' or row['id'] == user['id'])
-            task_form = form('/admin/tarefa', prefill + input_field('Título', 'title', message['body'][:120]) + '<label>Descrição<textarea name="description" rows="4">' + esc(message['body']) + '</textarea></label>' + field('Prazo', 'due_at', 'datetime-local', required=False) + '<label>Responsável<select name="assigned_to">' + assign_options + '</select></label><label>Prioridade<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>', 'Criar tarefa vinculada')
+            assign_options = '<option value="">Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff if row['id'] != user['id'])
+            task_form = form('/admin/tarefa', prefill + input_field('Título', 'title', message['body'][:120]) + '<label>Descrição<textarea name="description" rows="4">' + esc(message['body']) + '</textarea></label>' + task_due_fields() + '<label>Responsável<select name="assigned_to">' + assign_options + '</select></label><label>Prioridade<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>', 'Criar tarefa vinculada')
             case_label = esc(case_row['title']) if case_row else 'Sem caso vinculado'
             content = '<section class="wrap section admin-workspace">' + self.admin_nav(user) + '<a class="text-link" href="/conversas/' + str(message['conversation_id']) + '">← Voltar à conversa</a><p class="eyebrow">NOVA TAREFA</p><h1>Transformar mensagem em tarefa</h1><p class="muted">Caso: ' + case_label + '</p>' + card('Mensagem de origem', '<p>' + highlight_mentions(message['body']) + '</p>') + card('Tarefa', task_form) + '</section>'
             return self.page('Nova tarefa', content, user)
@@ -3299,13 +3399,15 @@ class Handler(BaseHTTPRequestHandler):
                 history = c.execute("SELECT a.*,u.name AS actor FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.entity='task' AND a.entity_id=? ORDER BY a.id DESC LIMIT 20", (task_id,)).fetchall()
             client_options = '<option value="">Sem cliente</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if task['client_id'] == row['id'] else '') + '>' + esc(row['name']) + '</option>' for row in clients)
             case_options = '<option value="">Sem caso específico</option>' + ''.join('<option value="' + str(row['id']) + '" data-client-id="' + str(row['client_id']) + '"' + (' selected' if task['case_id'] == row['id'] else '') + '>#' + str(row['id']) + ' — ' + esc(row['title']) + '</option>' for row in cases)
-            assign_options = '<option value="">Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if task['assigned_to'] == row['id'] else '') + '>' + esc(row['name']) + '</option>' for row in staff if user['role'] != 'staff' or row['id'] == user['id'])
+            assign_options = '<option value=""' + (' selected' if not task['assigned_to'] or task['assigned_to'] == user['id'] else '') + '>Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if task['assigned_to'] == row['id'] else '') + '>' + esc(row['name']) + '</option>' for row in staff if row['id'] != user['id'])
             priority_options = ''.join('<option value="' + value + '"' + (' selected' if task['priority'] == value else '') + '>' + label + '</option>' for value, label in TASK_PRIORITY_LABELS.items())
             status_options = ''.join('<option value="' + value + '"' + (' selected' if task['status'] == value else '') + '>' + label + '</option>' for value, label in TASK_STATUS_LABELS.items())
-            due_value = str(task['due_at']).replace(' ', 'T')[:16] if task['due_at'] else ''
+            due_raw = str(task['due_at'] or '')
+            due_date_value = due_raw[:10] if len(due_raw) >= 10 else ''
+            due_time_value = due_raw[11:16] if len(due_raw) >= 16 else ''
             collaborator_options = ''.join('<label class="check"><input type="checkbox" name="collaborator_' + str(row['id']) + '" value="1"' + (' checked' if row['id'] in collaborators else '') + '> ' + esc(row['name']) + '</label>' for row in staff)
             document_options = '<option value="">Sem documento vinculado</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if task['document_id'] == row['id'] else '') + '>' + esc(row['filename']) + '</option>' for row in documents)
-            edit_form = form('/admin/tarefa/editar', '<input type="hidden" name="task_id" value="' + str(task_id) + '">' + input_field('Título', 'title', task['title']) + '<label>Descrição<textarea name="description" rows="4">' + esc(task['description']) + '</textarea></label>' + '<label>Cliente<select name="client_id" data-context-client>' + client_options + '</select></label><label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label><label>Responsável<select name="assigned_to">' + assign_options + '</select></label><fieldset class="check-group"><legend>Colaboradores</legend>' + collaborator_options + '</fieldset><label>Documento vinculado (opcional)<select name="document_id">' + document_options + '</select></label><label>Prazo<input type="datetime-local" name="due_at" value="' + esc(due_value) + '"></label><label>Prioridade<select name="priority">' + priority_options + '</select></label><label>Situação<select name="status">' + status_options + '</select></label>', 'Salvar alterações')
+            edit_form = form('/admin/tarefa/editar', '<input type="hidden" name="task_id" value="' + str(task_id) + '">' + input_field('Título', 'title', task['title']) + '<label>Descrição<textarea name="description" rows="4">' + esc(task['description']) + '</textarea></label>' + '<label>Cliente<select name="client_id" data-context-client>' + client_options + '</select></label><label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label><label>Responsável<select name="assigned_to">' + assign_options + '</select></label><fieldset class="check-group"><legend>Colaboradores</legend>' + collaborator_options + '</fieldset><label>Documento vinculado (opcional)<select name="document_id">' + document_options + '</select></label>' + task_due_fields(due_date_value, due_time_value) + '<label>Prioridade<select name="priority">' + priority_options + '</select></label><label>Situação<select name="status">' + status_options + '</select></label>', 'Salvar alterações')
             history_html = ''.join('<li><strong>' + esc(item['created']) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
             delete_form = form('/admin/tarefa/excluir', '<input type="hidden" name="task_id" value="' + str(task_id) + '">', 'Excluir tarefa')
             subtask_items = ''.join('<li><form method="post" action="/admin/tarefa/subtarefa" class="inline-form"><input type="hidden" name="csrf" value="' + CSRF_PLACEHOLDER + '"><input type="hidden" name="task_id" value="' + str(task_id) + '"><input type="hidden" name="subtask_id" value="' + str(item['id']) + '"><input type="hidden" name="operation" value="toggle"><button class="text-link" type="submit">' + ('✓ ' if item['completed'] else '○ ') + esc(item['title']) + '</button></form> <form method="post" action="/admin/tarefa/subtarefa" class="inline-form"><input type="hidden" name="csrf" value="' + CSRF_PLACEHOLDER + '"><input type="hidden" name="task_id" value="' + str(task_id) + '"><input type="hidden" name="subtask_id" value="' + str(item['id']) + '"><input type="hidden" name="operation" value="delete"><button class="text-link" type="submit" aria-label="Excluir subtarefa">×</button></form></li>' for item in subtasks) or '<li>Nenhuma subtarefa.</li>'
@@ -3322,6 +3424,9 @@ class Handler(BaseHTTPRequestHandler):
             client_filter = query.get('client_id', [''])[0]
             case_filter = query.get('case_id', [''])[0]
             responsible_filter = query.get('responsavel', [''])[0]
+            task_date = query.get('data', [''])[0]
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', task_date):
+                task_date = ''
             with db() as c:
                 if not has_permission(c, user, 'manage_cases'):
                     return self.forbidden()
@@ -3352,12 +3457,12 @@ class Handler(BaseHTTPRequestHandler):
             client_options = '<option value="">Sem cliente</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if str(row['id']) == valid_client else '') + '>' + esc(row['name']) + '</option>' for row in clients)
             client_select = '<label>Cliente (opcional)<select name="client_id" data-context-client>' + client_options + '</select></label>'
             case_select = admin_case_select(cases, valid_case)
-            assign_options = '<option value="">Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff if user['role'] != 'staff' or row['id'] == user['id'])
+            assign_options = '<option value="">Atribuir a mim</option>' + ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff if row['id'] != user['id'])
             assign_select = '<label>Responsável<select name="assigned_to">' + assign_options + '</select></label>'
             priority_options = ''.join('<option value="' + value + '">' + label + '</option>' for value, label in (('normal', 'Normal'), ('alta', 'Alta'), ('urgente', 'Urgente')))
             collaborator_options = ''.join('<label class="check"><input type="checkbox" name="collaborator_' + str(row['id']) + '" value="1"> ' + esc(row['name']) + '</label>' for row in staff)
             document_options = '<option value="">Sem documento vinculado</option>' + ''.join('<option value="' + str(row['id']) + '">' + esc(row['filename']) + '</option>' for row in documents)
-            create_form = form('/admin/tarefa', field('Título', 'title') + '<label>Descrição<textarea name="description" rows="3"></textarea></label>' + field('Prazo', 'due_at', 'datetime-local', required=False) + '<label>Prioridade<select name="priority">' + priority_options + '</select></label>' + client_select + case_select + assign_select + '<fieldset class="check-group"><legend>Colaboradores</legend>' + collaborator_options + '</fieldset><label>Documento vinculado (opcional)<select name="document_id">' + document_options + '</select></label>', 'Criar tarefa')
+            create_form = form('/admin/tarefa', field('Título', 'title') + '<label>Descrição<textarea name="description" rows="3"></textarea></label>' + task_due_fields(task_date) + '<label>Prioridade<select name="priority">' + priority_options + '</select></label>' + client_select + case_select + assign_select + '<fieldset class="check-group"><legend>Colaboradores</legend>' + collaborator_options + '</fieldset><label>Documento vinculado (opcional)<select name="document_id">' + document_options + '</select></label>', 'Criar tarefa')
             status_options = ''.join('<option value="' + value + '"' + (' selected' if state == value else '') + '>' + label + '</option>' for value, label in (('abertas', 'Em aberto'), ('atrasadas', 'Atrasadas'), ('pendente', 'Pendentes'), ('em_andamento', 'Em andamento'), ('concluida', 'Concluídas'), ('todas', 'Todas')))
             responsible_options = '<option value="">Todos</option>' + ''.join('<option value="' + str(row['id']) + '"' + (' selected' if responsible_filter == str(row['id']) else '') + '>' + esc(row['name']) + '</option>' for row in staff)
             filters = '<form method="get" action="/admin/tarefas" class="admin-filters"><label>Buscar<input type="search" name="q" value="' + esc(term) + '" placeholder="Tarefa, cliente ou caso"></label><label>Situação<select name="status">' + status_options + '</select></label><label>Responsável<select name="responsavel">' + responsible_options + '</select></label>' + ('<input type="hidden" name="client_id" value="' + esc(valid_client) + '">' if valid_client else '') + ('<input type="hidden" name="case_id" value="' + esc(valid_case) + '">' if valid_case else '') + '<button class="btn" type="submit">Filtrar</button><a class="text-link" href="/admin/tarefas">Limpar</a></form>'
@@ -3477,8 +3582,10 @@ class Handler(BaseHTTPRequestHandler):
             participants_options = ''.join('<option value="' + str(row['id']) + '"' + (' selected' if row['id'] in selected_participants else '') + '>' + esc(row['name']) + '</option>' for row in staff)
             participants_select = '<fieldset class="check-group"><legend>Participantes</legend>' + ''.join('<label class="check"><input type="checkbox" name="participant_' + str(row['id']) + '" value="1"' + (' checked' if row['id'] in selected_participants else '') + '> ' + esc(row['name']) + '</label>' for row in staff) + '</fieldset>'
             status_options = ''.join('<option value="' + value + '"' + (' selected' if appointment['status'] == value else '') + '>' + label + '</option>' for value, label in (('pendente', 'Pendente'), ('realizado', 'Realizado'), ('cancelado', 'Cancelado')))
-            due_value = str(appointment['when_at']).replace(' ', 'T')[:16]
-            form_html = form('/admin/compromisso/editar', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '">' + input_field('Título do evento', 'title', appointment['title']) + '<label>Tipo<select name="kind">' + kind_options + '</select></label><label>Privacidade<select name="privacy">' + privacy_options + '</select></label>' + '<label>Cliente (opcional)<select name="client_id" data-context-client>' + client_options + '</select></label>' + '<label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label>' + '<label>Responsável<select name="owner_id">' + owner_options + '</select></label>' + participants_select + '<label>Data e hora<input type="datetime-local" name="when_at" value="' + esc(due_value) + '" required></label>' + input_field('Local ou link', 'location', appointment['location'], required=False) + '<label>Lembrete<select name="reminder_choice">' + reminder_options + '</select></label><label>Situação<select name="status">' + status_options + '</select></label><label>Orientações<textarea name="notes">' + esc(appointment['notes']) + '</textarea></label>', 'Salvar alterações')
+            when_raw = str(appointment['when_at'] or '')
+            when_date_value = when_raw[:10] if len(when_raw) >= 10 else ''
+            when_time_value = when_raw[11:16] if len(when_raw) >= 16 else ''
+            form_html = form('/admin/compromisso/editar', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '">' + input_field('Título do evento', 'title', appointment['title']) + '<label>Tipo<select name="kind">' + kind_options + '</select></label><label>Privacidade<select name="privacy">' + privacy_options + '</select></label>' + '<label>Cliente (opcional)<select name="client_id" data-context-client>' + client_options + '</select></label>' + '<label>Caso<select name="case_id" data-context-case>' + case_options + '</select></label>' + '<label>Responsável<select name="owner_id">' + owner_options + '</select></label>' + participants_select + appointment_when_fields(when_date_value, when_time_value) + input_field('Local ou link', 'location', appointment['location'], required=False) + '<label>Lembrete<select name="reminder_choice">' + reminder_options + '</select></label><label>Situação<select name="status">' + status_options + '</select></label><label>Orientações<textarea name="notes">' + esc(appointment['notes']) + '</textarea></label>', 'Salvar alterações')
             history_html = ''.join('<li><strong>' + esc(item['created']) + ' — ' + esc(item['action']) + '</strong><br><small>' + esc(item['actor'] or 'Sistema') + ' · ' + esc(item['detail']) + '</small></li>' for item in history) or '<li>Nenhuma alteração registrada.</li>'
             cancel_form = form('/admin/compromisso/status', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '"><input type="hidden" name="status" value="cancelado">', 'Cancelar evento') if appointment['status'] != 'cancelado' else ''
             delete_form = form('/admin/compromisso/excluir', '<input type="hidden" name="appointment_id" value="' + str(appointment_id) + '">', 'Excluir evento') if is_super(user) or appointment['created_by'] == user['id'] else ''
@@ -3493,6 +3600,9 @@ class Handler(BaseHTTPRequestHandler):
             state = query.get('status', ['pendente'])[0]
             view_mode = query.get('visao', ['lista'])[0]
             month_raw = query.get('mes', [''])[0]
+            calendar_date = query.get('data', [''])[0]
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', calendar_date):
+                calendar_date = ''
             calendar_mode = view_mode == 'mes'
             kind_filter = query.get('tipo', [''])[0]
             term = query.get('q', [''])[0].strip()[:150]
@@ -3554,7 +3664,8 @@ class Handler(BaseHTTPRequestHandler):
                 for day in range(1, days_in_month + 1):
                     date_key = f'{year:04d}-{month:02d}-{day:02d}'
                     day_events = ''.join('<a class="calendar-event status-border-' + status_color(appointment['status']) + '" href="' + ('/admin/caso/historico?case_id=' + str(appointment['case_id']) if appointment['case_id'] else '/admin/compromissos') + '"><strong>' + esc(str(appointment['when_at'])[11:16]) + '</strong> ' + esc(appointment['title']) + '<small>' + esc(appointment['client'] or 'Evento interno') + '</small></a>' for appointment in by_day.get(date_key, [])) + ''.join('<a class="calendar-event calendar-task status-border-' + ('red' if task_is_overdue(task) else 'yellow') + '" href="/admin/tarefa?task_id=' + str(task['id']) + '"><strong>Prazo</strong> ' + esc(task['title']) + '<small>' + esc(task['client_name'] or task['case_title'] or 'Tarefa interna') + '</small></a>' for task in tasks_by_day.get(date_key, []))
-                    cells.append('<td class="calendar-day' + (' has-events' if day_events else '') + (' is-today' if date_key == datetime.date.today().strftime('%Y-%m-%d') else '') + '"><span class="calendar-day-number">' + str(day) + '</span><div class="calendar-events">' + day_events + '</div></td>')
+                    day_tools = '<div class="calendar-day-tools"><a href="/admin/compromissos?novo=1&data=' + date_key + '">+ Compromisso</a><a href="/admin/tarefas?novo=1&data=' + date_key + '">+ Tarefa</a></div>'
+                    cells.append('<td class="calendar-day' + (' has-events' if day_events else '') + (' is-today' if date_key == datetime.date.today().strftime('%Y-%m-%d') else '') + '" data-calendar-date="' + date_key + '"><span class="calendar-day-number">' + str(day) + '</span><div class="calendar-events">' + day_events + '</div>' + day_tools + '</td>')
                 while len(cells) % 7:
                     cells.append('<td class="calendar-day is-empty"></td>')
                 rows = ''.join('<tr>' + ''.join(cells[index:index + 7]) + '</tr>' for index in range(0, len(cells), 7))
@@ -3575,7 +3686,7 @@ class Handler(BaseHTTPRequestHandler):
             privacy_options = ''.join('<option value="' + value + '"' + (' selected' if value == 'internal' else '') + '>' + label + '</option>' for value, label in (('private', 'Pessoal — somente eu'), ('internal', 'Interno — toda a equipe'), ('client', 'Vinculado ao cliente/caso')))
             participants_options = ''.join('<option value="' + str(row['id']) + '">' + esc(row['name']) + '</option>' for row in staff)
             participants_select = '<fieldset class="check-group"><legend>Participantes</legend>' + ''.join('<label class="check"><input type="checkbox" name="participant_' + str(row['id']) + '" value="1"> ' + esc(row['name']) + '</label>' for row in staff) + '</fieldset>'
-            create_form = form('/admin/appointment', admin_context_hidden(clients, cases, valid_client, valid_case) + client_select + admin_case_select(cases, valid_case) + field('Título do evento', 'title') + '<label>Tipo<select name="kind">' + kind_options + '</select></label><label>Privacidade<select name="privacy">' + privacy_options + '</select></label>' + field('Data e hora', 'when_at', 'datetime-local') + field('Local ou link', 'location', required=False) + '<label>Responsável interno<select name="owner_id">' + owner_options + '</select></label>' + participants_select + reminder_select + field('Orientações', 'notes', required=False), 'Cadastrar')
+            create_form = form('/admin/appointment', admin_context_hidden(clients, cases, valid_client, valid_case) + client_select + admin_case_select(cases, valid_case) + field('Título do evento', 'title') + '<label>Tipo<select name="kind">' + kind_options + '</select></label><label>Privacidade<select name="privacy">' + privacy_options + '</select></label>' + appointment_when_fields(calendar_date, '') + field('Local ou link', 'location', required=False) + '<label>Responsável interno<select name="owner_id">' + owner_options + '</select></label>' + participants_select + reminder_select + field('Orientações', 'notes', required=False), 'Cadastrar')
             items = ''.join('<div class="case-box"><strong>' + esc(fmt_when(appointment['when_at'])) + ' — ' + esc(appointment['title']) + '</strong><p>' + esc(appointment['client'] or 'Evento interno') + ((' · ' + esc(appointment['case_title'])) if appointment['case_title'] else '') + ' ' + appointment_badge(appointment['status']) + ' <span class="status-badge status-gray">' + TASK_KIND_LABELS.get(appointment['kind'] or 'compromisso', 'Compromisso') + '</span></p><p class="muted">' + (('Local: ' + esc(appointment['location']) + ' · ') if appointment['location'] else '') + (('Responsável: ' + esc(appointment['owner_name']) + ' · ') if appointment['owner_name'] else '') + (('Lembrete: ' + {'none': 'sem lembrete', '1h': '1 hora antes', '1d': '1 dia antes', 'global': 'padrão do escritório'}.get(appointment['reminder_choice'], appointment['reminder_choice']) + ' · ') if appointment['reminder_choice'] else '') + esc(appointment['notes']) + '</p><p><a class="text-link" href="/admin/compromisso?appointment_id=' + str(appointment['id']) + '">Editar evento →</a></p><details class="admin-secondary"><summary>Alterar situação</summary>' + form('/admin/compromisso/status', '<input type="hidden" name="appointment_id" value="' + str(appointment['id']) + '"><label>Status<select name="status">' + ''.join('<option' + (' selected' if appointment['status'] == s else '') + '>' + s + '</option>' for s in ('pendente','realizado','cancelado')) + '</select></label>', 'Salvar situação') + '</details></div>' for appointment in appointments) or '<p>Nenhum compromisso encontrado.</p>'
             status_options = ''.join('<option value="' + value + '"' + (' selected' if state == value else '') + '>' + label + '</option>' for value, label in (('pendente', 'Pendentes'), ('realizado', 'Realizados'), ('cancelado', 'Cancelados'), ('todos', 'Todos')))
             kind_filter_options = '<option value="">Todos os tipos</option>' + ''.join('<option value="' + value + '"' + (' selected' if kind_filter == value else '') + '>' + label + '</option>' for value, label in TASK_KIND_LABELS.items())
@@ -3604,7 +3715,7 @@ class Handler(BaseHTTPRequestHandler):
             case_select = '<label>Caso<select name="case_id">' + case_options + '</select></label>'
             create_form = form('/admin/update', select + case_select + field('Título', 'title') + '<label>Descrição<textarea name="body" required></textarea></label>', 'Publicar') if clients else '<p class="muted">Nenhum cliente atribuído.</p>'
             items = ''.join(card(update['title'], '<p class="muted">' + esc(update['client']) + ' · ' + esc(update['case_title'] or 'Caso geral') + ' · ' + esc(update['created']) + '</p><p>' + esc(update['body']) + '</p>') for update in update_rows) or '<p>Nenhuma atualização.</p>'
-            content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Atualizações</h1>' + card('Publicar atualização', create_form) + card('Publicações', items) + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
+            content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Atualizações</h1>' + card('Publicar atualização', create_form) + card('Publicações', '<div class="publication-list">' + items + '</div>') + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
             return self.page('Atualizações', content, user)
         if path == '/admin/conteudos':
             if not user or user['role'] not in ('admin', 'staff'):
@@ -3613,7 +3724,7 @@ class Handler(BaseHTTPRequestHandler):
                 posts = c.execute('SELECT * FROM posts ORDER BY id DESC').fetchall()
             create_form = form('/admin/post', field('Título', 'title') + field('Categoria', 'category') + '<label>Texto<textarea name="body" required></textarea></label><label class="check"><input type="checkbox" name="published" value="1"> Publicar no site</label>', 'Salvar conteúdo')
             items = ''.join('<li>' + esc(post['title']) + ' — ' + ('Publicado' if post['published'] else 'Rascunho') + ' — ' + esc(post['created']) + '</li>' for post in posts) or '<li>Nenhum conteúdo.</li>'
-            content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Conteúdos jurídicos</h1>' + card('Novo conteúdo', create_form) + card('Publicações', '<ul>' + items + '</ul>') + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
+            content = '<section class="wrap section">' + self.admin_nav(user) + '<h1>Conteúdos jurídicos</h1>' + card('Novo conteúdo', create_form) + card('Publicações', '<ul class="publication-list">' + items + '</ul>') + '<p><a class="text-link" href="/admin">Voltar ao painel</a></p></section>'
             return self.page('Conteúdos jurídicos', content, user)
         if path == '/admin/faq':
             if not user or user['role'] not in ('admin', 'staff'):
@@ -4278,11 +4389,7 @@ class Handler(BaseHTTPRequestHandler):
                     owner_id = to_int(fields, 'owner_id', required=False) or user['id']
                     if not c.execute("SELECT 1 FROM users WHERE id=? AND role IN ('admin','staff') AND active=1 AND deleted_at=''", (owner_id,)).fetchone():
                         raise ValidationError('Responsável inválido.')
-                    raw_when = text_field(fields, 'when_at', 50, True, 'data e hora')
-                    try:
-                        when_dt = datetime.datetime.strptime(raw_when, '%Y-%m-%dT%H:%M')
-                    except ValueError:
-                        raise ValidationError('Data e hora inválidas.')
+                    when_dt = appointment_when_from_fields(fields)
                     location = text_field(fields, 'location', 300)
                     notes = text_field(fields, 'notes', 1000)
                     status = str(fields.get('status', appointment['status']))
@@ -4451,17 +4558,22 @@ class Handler(BaseHTTPRequestHandler):
                         return self.forbidden()
                     name = text_field(fields, 'name', 150, True, 'nome')
                     phone = text_field(fields, 'phone', 40)
+                    email = email_field(fields, required=False)
+                    address = text_field(fields, 'address', 300)
                     owner = user['id'] if user['role'] == 'staff' else 0
                     if user['role'] == 'admin' and str(fields.get('owner_staff_id', '')).strip():
                         owner = to_int(fields, 'owner_staff_id')
                         if not c.execute("SELECT 1 FROM users WHERE id=? AND role IN ('staff','admin') AND deleted_at=''", (owner,)).fetchone():
                             raise ValidationError('Responsável inválido.')
-                    placeholder = 'cliente-' + secrets.token_hex(12) + '@interno.local'
-                    cursor = c.execute('INSERT INTO users(name,email,password,role,active,must_change,portal_enabled,phone,created_by,owner_staff_id) VALUES(?,?,?,?,1,0,0,?,?,?)', (name, placeholder, pwd(secrets.token_urlsafe(24)), 'client', phone, user['id'], owner or None))
+                    placeholder = email or ('cliente-' + secrets.token_hex(12) + '@interno.local')
+                    try:
+                        cursor = c.execute('INSERT INTO users(name,email,password,role,active,must_change,portal_enabled,phone,address,created_by,owner_staff_id) VALUES(?,?,?,?,1,0,0,?,?,?,?)', (name, placeholder, pwd(secrets.token_urlsafe(24)), 'client', phone, address, user['id'], owner or None))
+                    except IntegrityError:
+                        raise ValidationError('E-mail ja cadastrado.')
                     new_client = cursor.lastrowid
                     if owner:
                         c.execute('INSERT OR IGNORE INTO assignments(staff_id,client_id) VALUES(?,?)', (owner, new_client))
-                    self.audit_action(c, user['id'], 'criar cliente interno', name, entity='user', entity_id=new_client, client_id=new_client, after={'name': name, 'phone': phone, 'portal_enabled': 0, 'owner_staff_id': owner or None})
+                    self.audit_action(c, user['id'], 'criar cliente interno', name, entity='user', entity_id=new_client, client_id=new_client, after={'name': name, 'email': email, 'phone': phone, 'address': address, 'portal_enabled': 0, 'owner_staff_id': owner or None})
                     redirect_to = '/admin/cliente?client_id=' + str(new_client)
                 elif path == '/admin/cliente':
                     if user['role'] not in ('admin', 'staff') or not has_permission(c, user, 'create_clients'):
@@ -4469,6 +4581,7 @@ class Handler(BaseHTTPRequestHandler):
                     name = text_field(fields, 'name', 150, True, 'nome')
                     email = email_field(fields)
                     phone = text_field(fields, 'phone', 40)
+                    address = text_field(fields, 'address', 300)
                     password = password_field(fields, 'password')
                     confirm = password_field(fields, 'confirm')
                     if password != confirm:
@@ -4480,13 +4593,13 @@ class Handler(BaseHTTPRequestHandler):
                         if not c.execute("SELECT 1 FROM users WHERE id=? AND role IN ('staff','admin') AND deleted_at=''", (owner,)).fetchone():
                             raise ValidationError('Responsável inválido.')
                     try:
-                        cursor = c.execute('INSERT INTO users(name,email,password,role,active,must_change,phone,created_by,owner_staff_id) VALUES(?,?,?,?,1,1,?,?,?)', (name, email, pwd(password), 'client', phone, user['id'], owner or None))
+                        cursor = c.execute('INSERT INTO users(name,email,password,role,active,must_change,phone,address,created_by,owner_staff_id) VALUES(?,?,?,?,1,1,?,?,?,?)', (name, email, pwd(password), 'client', phone, address, user['id'], owner or None))
                     except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     new_client = cursor.lastrowid
                     if owner:
                         c.execute('INSERT OR IGNORE INTO assignments(staff_id,client_id) VALUES(?,?)', (owner, new_client))
-                    self.audit_action(c, user['id'], 'criar cliente', email, entity='user', entity_id=new_client, client_id=new_client, after={'name': name, 'email': email, 'phone': phone, 'owner_staff_id': owner or None})
+                    self.audit_action(c, user['id'], 'criar cliente', email, entity='user', entity_id=new_client, client_id=new_client, after={'name': name, 'email': email, 'phone': phone, 'address': address, 'owner_staff_id': owner or None})
                     redirect_to = '/admin/clientes'
                 elif path == '/admin/cliente/portal':
                     if not has_permission(c, user, 'create_clients'):
@@ -4517,6 +4630,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self.forbidden()
                     name = text_field(fields, 'name', 150, True, 'nome')
                     phone = text_field(fields, 'phone', 40)
+                    address = text_field(fields, 'address', 300)
                     active = 1 if fields.get('active') == '1' else 0
                     email = client_row['email']
                     owner = client_row['owner_staff_id']
@@ -4526,9 +4640,9 @@ class Handler(BaseHTTPRequestHandler):
                         owner = to_int(fields, 'owner_staff_id') if raw_owner else None
                         if owner and not c.execute("SELECT 1 FROM users WHERE id=? AND role IN ('staff','admin') AND deleted_at=''", (owner,)).fetchone():
                             raise ValidationError('Responsável inválido.')
-                    before = {k: client_row[k] for k in ('name', 'email', 'phone', 'active', 'owner_staff_id')}
+                    before = {k: client_row[k] for k in ('name', 'email', 'phone', 'address', 'active', 'owner_staff_id')}
                     try:
-                        c.execute('UPDATE users SET name=?,email=?,phone=?,active=?,owner_staff_id=? WHERE id=?', (name, email, phone, active, owner, client))
+                        c.execute('UPDATE users SET name=?,email=?,phone=?,address=?,active=?,owner_staff_id=? WHERE id=?', (name, email, phone, address, active, owner, client))
                     except IntegrityError:
                         raise ValidationError('E-mail já cadastrado.')
                     if user['role'] == 'admin':
@@ -4539,7 +4653,7 @@ class Handler(BaseHTTPRequestHandler):
                         password = password_field(fields, 'password')
                         check_password_strength(password)
                         c.execute('UPDATE users SET password=?,must_change=1 WHERE id=?', (pwd(password), client))
-                    self.audit_action(c, user['id'], 'editar cliente', email, entity='user', entity_id=client, client_id=client, before=before, after={'name': name, 'email': email, 'phone': phone, 'active': active, 'owner_staff_id': owner})
+                    self.audit_action(c, user['id'], 'editar cliente', email, entity='user', entity_id=client, client_id=client, before=before, after={'name': name, 'email': email, 'phone': phone, 'address': address, 'active': active, 'owner_staff_id': owner})
                     redirect_to = '/admin/clientes'
                 elif path == '/admin/delete':
                     if not is_super(user):
@@ -4959,13 +5073,7 @@ class Handler(BaseHTTPRequestHandler):
                     priority = str(fields.get('priority', 'normal'))
                     if priority not in TASK_PRIORITY_LABELS:
                         raise ValidationError('Prioridade inválida.')
-                    due_raw = str(fields.get('due_at', '')).strip()
-                    due_at = ''
-                    if due_raw:
-                        try:
-                            due_at = datetime.datetime.strptime(due_raw, '%Y-%m-%dT%H:%M').strftime('%Y-%m-%d %H:%M')
-                        except ValueError:
-                            raise ValidationError('Prazo inválido.')
+                    due_at = task_due_from_fields(fields)
                     source_message_id = to_int(fields, 'source_message_id', required=False)
                     if source_message_id:
                         source_message = c.execute("SELECT m.*,cv.visibility,cv.case_id FROM messages m JOIN conversations cv ON cv.id=m.conversation_id WHERE m.id=?", (source_message_id,)).fetchone()
@@ -5057,13 +5165,7 @@ class Handler(BaseHTTPRequestHandler):
                     status = str(fields.get('status', 'pendente'))
                     if priority not in TASK_PRIORITY_LABELS or status not in TASK_STATUS_LABELS:
                         raise ValidationError('Prioridade ou situação inválida.')
-                    due_raw = str(fields.get('due_at', '')).strip()
-                    due_at = ''
-                    if due_raw:
-                        try:
-                            due_at = datetime.datetime.strptime(due_raw, '%Y-%m-%dT%H:%M').strftime('%Y-%m-%d %H:%M')
-                        except ValueError:
-                            raise ValidationError('Prazo inválido.')
+                    due_at = task_due_from_fields(fields)
                     document_id = to_int(fields, 'document_id', required=False)
                     if document_id:
                         document = c.execute("SELECT * FROM documents WHERE id=? AND deleted_at=''", (document_id,)).fetchone()
@@ -5219,11 +5321,7 @@ class Handler(BaseHTTPRequestHandler):
                         notify(c, client, 'update', 'Nova atualização do escritório', title, '/cliente', client, case_id or None, 'update-' + str(update_id) + '-client')
                         self.audit_action(c, user['id'], 'publicar atualização', title, entity='update', client_id=client, case_id=case_id or None, after={'title': title, 'body': body})
                     else:
-                        raw_when = text_field(fields, 'when_at', 50, True, 'data e hora')
-                        try:
-                            when_dt = datetime.datetime.strptime(raw_when, '%Y-%m-%dT%H:%M')
-                        except ValueError:
-                            raise ValidationError('Data e hora inválidas.')
+                        when_dt = appointment_when_from_fields(fields)
                         notes = text_field(fields, 'notes', 1000)
                         kind = str(fields.get('kind', 'compromisso'))
                         if kind not in TASK_KIND_LABELS:

@@ -34,9 +34,39 @@ document.querySelectorAll('#nav a').forEach((link) => {
   }
 });
 
+const chatFormSelector = '[data-chat-form],[data-chat-start-form],form[action="/admin/chat-equipe"],form[action="/conversas/responder"],form[action="/atendimento/responder"],form[action="/admin/atendimento-visitante/responder"]';
+const isChatForm = (form) => Boolean(form && form.matches && form.matches(chatFormSelector));
+
+document.addEventListener('submit', (event) => {
+  const form = event.target;
+  if (!isChatForm(form)) return;
+  if (form.dataset.submitting === '1') {
+    event.preventDefault();
+    return;
+  }
+  form.dataset.submitting = '1';
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+}, true);
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+  const textarea = event.target.closest('textarea');
+  if (!textarea) return;
+  const form = textarea.closest('form');
+  if (!isChatForm(form) || form.dataset.submitting === '1') return;
+  const file = form.querySelector('input[type="file"]');
+  if (!textarea.value.trim() && !(file && file.files && file.files.length)) return;
+  event.preventDefault();
+  if (typeof form.requestSubmit === 'function') form.requestSubmit();
+  else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+});
+
 const blSoundEnabled = () => {
-  try { return localStorage.getItem('bl-notif-sound') === '1'; }
-  catch (error) { return false; }
+  try {
+    const stored = localStorage.getItem('bl-notif-sound');
+    return stored === null ? true : stored === '1';
+  } catch (error) { return true; }
 };
 
 const blPlaySound = () => {
@@ -45,19 +75,23 @@ const blPlaySound = () => {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) return;
     const ctx = new AudioCtx();
-    const oscillator = ctx.createOscillator();
-    const gain = ctx.createGain();
-    oscillator.type = 'sine';
-    oscillator.frequency.setValueAtTime(740, ctx.currentTime);
-    oscillator.frequency.exponentialRampToValueAtTime(980, ctx.currentTime + 0.12);
-    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.12, ctx.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.2);
-    oscillator.connect(gain);
-    gain.connect(ctx.destination);
-    oscillator.start();
-    oscillator.stop(ctx.currentTime + 0.22);
-    oscillator.addEventListener('ended', () => ctx.close());
+    const play = () => {
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(740, ctx.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(980, ctx.currentTime + 0.12);
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.12, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.2);
+      oscillator.connect(gain);
+      gain.connect(ctx.destination);
+      oscillator.start();
+      oscillator.stop(ctx.currentTime + 0.22);
+      oscillator.addEventListener('ended', () => ctx.close());
+    };
+    if (ctx.state === 'suspended') ctx.resume().then(play).catch(() => ctx.close());
+    else play();
   } catch (error) { /* áudio indisponível */ }
 };
 
@@ -176,7 +210,7 @@ if (notifWrap) {
   const csrfToken = csrfMeta ? csrfMeta.content : '';
   const seenIds = new Set();
   const notificationTypes = {
-    message: ['Mensagens', 'messages'], internal: ['Relato interno', 'messages'],
+    message: ['Mensagens', 'messages'], internal: ['Relato interno', 'messages'], mention: ['Menção', 'messages'],
     document: ['Documentos', 'documents'], appointment: ['Compromissos', 'calendar'],
     pendency: ['Pendências', 'pending'], waiting_client: ['Pendências', 'pending'],
     case: ['Atendimentos', 'cases'], stale_case: ['Atendimentos', 'cases'],
@@ -187,6 +221,47 @@ if (notifWrap) {
   let currentUnread = 0;
   let filter = 'all';
   let firstLoad = true;
+  const baseTitle = document.title;
+  let titleAlertTimer = null;
+  let titleAlertCount = 0;
+  let iconLink = document.querySelector('link[rel="icon"]');
+  if (!iconLink) {
+    iconLink = document.createElement('link');
+    iconLink.rel = 'icon';
+    iconLink.type = 'image/svg+xml';
+    document.head.appendChild(iconLink);
+  }
+  const baseFavicon = iconLink.getAttribute('href') || '/static/favicon.svg';
+  const alertFavicon = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="30" fill="#1e8e3e"/><text x="32" y="44" text-anchor="middle" font-family="Arial" font-size="36" font-weight="bold" fill="#fff">!</text></svg>');
+  const restoreTitle = () => {
+    document.title = currentUnread ? `(${currentUnread}) ${baseTitle}` : baseTitle;
+  };
+  const stopTitleAlert = (keepCount = false) => {
+    if (titleAlertTimer) {
+      window.clearInterval(titleAlertTimer);
+      titleAlertTimer = null;
+    }
+    iconLink.setAttribute('href', baseFavicon);
+    if (keepCount) restoreTitle();
+    else document.title = baseTitle;
+  };
+  const startTitleAlert = (count) => {
+    titleAlertCount = Math.max(1, Number(count) || 1);
+    if (titleAlertTimer) return;
+    let highlighted = false;
+    const tick = () => {
+      highlighted = !highlighted;
+      document.title = highlighted
+        ? `\uD83D\uDFE2 ${titleAlertCount} nova notifica\u00e7\u00e3o \u2014 ${baseTitle}`
+        : `(${titleAlertCount}) ${baseTitle}`;
+      iconLink.setAttribute('href', highlighted ? alertFavicon : baseFavicon);
+    };
+    tick();
+    titleAlertTimer = window.setInterval(tick, 900);
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && titleAlertTimer) stopTitleAlert(true);
+  });
 
   const setPanel = (open, returnFocus = false) => {
     notifPanel.hidden = !open;
@@ -336,8 +411,10 @@ if (notifWrap) {
   };
 
   const browserNotificationsEnabled = () => {
-    try { return localStorage.getItem('bl-browser-notify') === '1'; }
-    catch (error) { return false; }
+    try {
+      const stored = localStorage.getItem('bl-browser-notify');
+      return stored === null ? true : stored === '1';
+    } catch (error) { return true; }
   };
 
   const render = (data) => {
@@ -355,10 +432,17 @@ if (notifWrap) {
     notifStatus.textContent = '';
     renderList();
     showToast(newItems);
+    if (newItems.length) startTitleAlert(unread);
+    else if (unread === 0) stopTitleAlert();
     if (browserNotificationsEnabled() && 'Notification' in window && Notification.permission === 'granted') {
       newItems.slice(0, 3).forEach((item) => {
         try {
-          new Notification(item.title, { body: item.body || '', tag: 'bl-notification-' + item.id });
+          const browserNotice = new Notification(item.title, { body: item.body || '', tag: 'bl-notification-' + item.id });
+          browserNotice.onclick = () => {
+            window.focus();
+            if (typeof item.url === 'string' && item.url.startsWith('/')) window.location.href = item.url;
+            browserNotice.close();
+          };
         } catch (error) {
           /* ignore */
         }
@@ -382,10 +466,22 @@ if (notifWrap) {
     }
   };
 
-  notifButton.addEventListener('click', () => {
+  notifButton.addEventListener('click', async () => {
     const open = notifPanel.hidden;
     setPanel(open);
-    if (open) loadNotifications();
+    if (open) {
+      stopTitleAlert(true);
+      if ('Notification' in window && Notification.permission === 'default') {
+        try {
+          const permission = await Notification.requestPermission();
+          if (permission === 'granted') {
+            localStorage.setItem('bl-browser-notify', '1');
+            notifEnable.textContent = 'Alertas do navegador ativados';
+          }
+        } catch (error) { /* permissao indisponivel */ }
+      }
+      loadNotifications();
+    }
   });
   notifClose.addEventListener('click', () => setPanel(false, true));
   notifFilterAll.addEventListener('click', () => { filter = 'all'; renderList(); });
@@ -396,6 +492,7 @@ if (notifWrap) {
     try {
       await markRead(null);
       await loadNotifications();
+      stopTitleAlert();
     } catch (error) {
       notifStatus.textContent = 'Não foi possível marcar os avisos como lidos. Tente novamente.';
       notifReadAll.disabled = false;
@@ -451,8 +548,9 @@ if (notifWrap) {
   });
 
   loadNotifications();
-  window.setInterval(loadNotifications, 30000);
+  window.setInterval(loadNotifications, 5000);
   window.addEventListener('conversation:read', loadNotifications);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadNotifications(); });
 }
 
 // O link continua funcionando como página normal em navegadores sem diálogo.
@@ -534,6 +632,7 @@ if (typeof HTMLDialogElement !== 'undefined' && HTMLDialogElement.prototype.show
           warning.textContent = 'Não foi possível concluir a operação. Verifique sua conexão e tente novamente.';
           form.prepend(warning);
           if (submit) submit.disabled = false;
+          form.dataset.submitting = '';
         }
       });
     });
@@ -674,6 +773,7 @@ if (chatWidget) {
   let chatOnline = chatWidget.dataset.chatOnline === '1';
   let chatHasSession = false;
   let chatLatestHtml = '';
+  let chatLastUnread = null;
   let chatPoll = null;
 
   const chatRequest = async (url, options = {}) => {
@@ -684,6 +784,8 @@ if (chatWidget) {
   };
 
   const chatSetStatus = (online, unread = 0) => {
+    if (chatLastUnread !== null && unread > chatLastUnread) blPlaySound();
+    chatLastUnread = unread;
     chatOnline = Boolean(online);
     if (chatPresence) chatPresence.className = 'chat-presence ' + (chatOnline ? 'is-online' : 'is-offline');
     if (chatTitle) chatTitle.textContent = chatOnline ? 'Atendimento online' : 'Atendimento fora do hor�rio';
@@ -755,6 +857,7 @@ if (chatWidget) {
       if (chatSubtitle) chatSubtitle.textContent = 'N�o foi poss�vel iniciar o atendimento.';
     } finally {
       if (button) button.disabled = false;
+      chatStartForm.dataset.submitting = '';
     }
   };
 
@@ -787,6 +890,7 @@ if (chatWidget) {
       if (chatSubtitle) chatSubtitle.textContent = 'N�o foi poss�vel enviar a mensagem.';
     } finally {
       if (button) button.disabled = false;
+      chatForm.dataset.submitting = '';
     }
   });
   chatLoadStatus();
@@ -922,6 +1026,8 @@ document.querySelectorAll('.mention-chip').forEach((chip) => {
 
 // === Modal: criar tarefa a partir de mensagem interna ===
 (function () {
+  const taskDialog = document.createElement('dialog');
+  taskDialog.className = 'task-modal-dialog';
   const overlay = document.createElement('div');
   overlay.className = 'task-modal-overlay';
   overlay.hidden = true;
@@ -934,13 +1040,19 @@ document.querySelectorAll('.mention-chip').forEach((chip) => {
     '<input type="hidden" name="case_id" value="">' +
     '<label>Título<input type="text" name="title" required maxlength="180"></label>' +
     '<label>Descrição<textarea name="description" rows="3"></textarea></label>' +
-    '<label>Prazo<input type="datetime-local" name="due_at"></label>' +
+    '<label>Data (opcional)<input type="date" name="due_date"></label>' +
+    '<label>Hora (opcional)<input type="time" name="due_time"></label>' +
     '<label>Prioridade<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>' +
     '<div class="task-modal-actions"><button type="submit" class="btn">Criar tarefa</button><button type="button" class="btn ghost task-modal-cancel">Cancelar</button></div>' +
     '</form></div>';
-  document.body.appendChild(overlay);
+  taskDialog.appendChild(overlay);
+  document.body.appendChild(taskDialog);
   const form = overlay.querySelector('form');
-  const close = () => { overlay.hidden = true; document.body.style.overflow = ''; };
+  const close = () => {
+    overlay.hidden = true;
+    if (taskDialog.open) taskDialog.close();
+    document.body.style.overflow = '';
+  };
   // Delegação: sobrevive à atualização automática do histórico de mensagens.
   document.addEventListener('click', (event) => {
     const button = event.target.closest('[data-task-from-message]');
@@ -953,11 +1065,40 @@ document.querySelectorAll('.mention-chip').forEach((chip) => {
     form.querySelector('[name=title]').value = (button.dataset.taskBody || '').slice(0, 120);
     form.querySelector('[name=description]').value = button.dataset.taskBody || '';
     overlay.hidden = false;
+    if (typeof taskDialog.showModal === 'function' && !taskDialog.open) taskDialog.showModal();
+    else taskDialog.setAttribute('open', '');
     document.body.style.overflow = 'hidden';
     form.querySelector('[name=title]').focus();
   });
   overlay.querySelector('.task-modal-close').addEventListener('click', close);
   overlay.querySelector('.task-modal-cancel').addEventListener('click', close);
   overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  taskDialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !overlay.hidden) close(); });
 })();
+
+document.querySelectorAll('input[type="datetime-local"], input[type="date"]').forEach((input) => {
+  if (input.dataset.pickerReady === '1') return;
+  input.dataset.pickerReady = '1';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'datetime-picker-btn';
+  button.textContent = 'Selecionar no calend\u00e1rio';
+  button.setAttribute('aria-label', 'Abrir calend\u00e1rio para escolher data e hora');
+  button.addEventListener('click', () => {
+    try {
+      if (typeof input.showPicker === 'function') input.showPicker();
+      else { input.focus(); input.click(); }
+    } catch (error) { input.focus(); }
+  });
+  input.insertAdjacentElement('afterend', button);
+});
+
+document.querySelectorAll('[data-calendar-date]').forEach((cell) => {
+  if (cell.dataset.calendarReady === '1') return;
+  cell.dataset.calendarReady = '1';
+  cell.addEventListener('click', (event) => {
+    if (event.target.closest('a,button,details,summary')) return;
+    window.location.href = '/admin/compromissos?novo=1&data=' + encodeURIComponent(cell.dataset.calendarDate);
+  });
+});
