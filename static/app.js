@@ -647,6 +647,8 @@ if (typeof HTMLDialogElement !== 'undefined' && HTMLDialogElement.prototype.show
     close.textContent = '×';
     close.addEventListener('click', () => dialog.close());
     dialog.replaceChildren(close, document.importNode(view, true));
+    const dialogThread = dialog.querySelector('.conversation-thread');
+    if (dialogThread) dialogThread.scrollTop = dialogThread.scrollHeight;
     dialog.querySelectorAll('form').forEach((form) => {
       if (form.action.endsWith('/conversas/ler')) return;
       form.addEventListener('submit', async (event) => {
@@ -1225,3 +1227,10 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   });
 }
+
+const scrollConversationThreads = () => {
+  document.querySelectorAll('.conversation-thread').forEach((thread) => {
+    thread.scrollTop = thread.scrollHeight;
+  });
+};
+window.addEventListener('load', scrollConversationThreads);

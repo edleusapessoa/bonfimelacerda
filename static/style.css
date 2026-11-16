@@ -1400,3 +1400,30 @@ input[type=file]::file-selector-button:hover{background:#ffd166}
 .content-card-cover.content-contain{aspect-ratio:auto!important;height:auto!important;overflow:visible!important}
 .content-card-cover.content-contain .content-cover{height:auto!important;max-height:none!important;object-fit:contain!important;background:transparent!important}
 .article-view>.content-cover.cover-contain{height:auto!important;max-height:none!important;object-fit:contain!important;background:transparent!important}
+
+/* Conversas lado a lado, compactas e com cores bem definidas */
+.conversation-view .message,.team-chat-thread .message,.guest-thread .message{max-width:72%!important;padding:8px 10px!important;border-radius:12px!important;font-size:13.5px!important;box-shadow:0 2px 8px #061d320d!important}
+.conversation-view .message[data-align="mine"],.team-chat-thread .message[data-align="mine"],.guest-thread .message[data-align="mine"]{align-self:flex-end!important;margin-left:auto!important;margin-right:0!important}
+.conversation-view .message[data-align="other"],.team-chat-thread .message[data-align="other"],.guest-thread .message[data-align="other"]{align-self:flex-start!important;margin-left:0!important;margin-right:auto!important}
+.message[data-align="mine"] .bubble,.message.client[data-align="mine"] .bubble,.message.office[data-align="mine"] .bubble,.message.internal[data-align="mine"] .bubble{background:#0b3f63!important;color:#fff!important;border:1px solid #155a86!important}
+.message[data-align="other"] .bubble,.message.client[data-align="other"] .bubble,.message.office[data-align="other"] .bubble{background:#edf4f8!important;color:#142333!important;border:1px solid #d4e2ea!important}
+.message.internal[data-align="other"] .bubble{background:#fff5dc!important;color:#4a3715!important;border-color:#ead9ac!important}
+.message .bubble p{color:inherit!important}
+.message[data-align="mine"] .bubble p,.message[data-align="mine"] .bubble span{color:#fff!important}
+.message[data-align="other"] .bubble p,.message[data-align="other"] .bubble span{color:inherit!important}
+.message .bubble{font-size:13.5px!important;line-height:1.5!important;padding:7px 10px!important;border-radius:12px!important}
+.message .message-meta{font-size:10px!important;margin:0 0 2px!important;color:#6b7b88!important}
+.message[data-align="mine"] .message-meta{text-align:right;color:#526170!important}
+.message .message-time{font-size:9px!important;margin-top:1px!important}
+.message[data-align="mine"] .message-time{color:#c8e0ef!important}
+.message[data-align="other"] .message-time{color:#6b7b88!important}
+.panel-area .conversation-view .message[data-align="mine"],.panel-area .team-chat-thread .message[data-align="mine"],.panel-area .guest-thread .message[data-align="mine"]{padding-left:10px!important}
+.panel-area .conversation-view .message[data-align="mine"] .message-avatar,.panel-area .team-chat-thread .message[data-align="mine"] .message-avatar,.panel-area .guest-thread .message[data-align="mine"] .message-avatar{display:none}
+.panel-area .conversation-view .message[data-align="mine"][data-avatar]::before,.panel-area .team-chat-thread .message[data-align="mine"][data-avatar]::before,.panel-area .guest-thread .message[data-align="mine"][data-avatar]::before{display:none}
+.conversation-view .conversation-thread{max-height:min(76vh,760px)!important}
+.panel-area .conversation-pane .conversation-thread{min-height:340px!important}
+.conversation-composer{padding:7px 0 0!important;background:#fff}
+.conversation-composer form{gap:4px!important}
+.conversation-composer textarea{min-height:44px!important;max-height:90px!important}
+.conversation-composer .chat-attachment-hint{font-size:10px!important;margin:0!important}
+.conversation-composer .btn{min-height:36px!important;height:36px!important;padding:7px 13px!important;font-size:12px!important}

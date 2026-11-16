@@ -760,6 +760,13 @@ def post_cover_html(post, large=False):
     return '<div class="content-cover-fallback content-tone-' + tone + (' content-cover-large' if large else '') + '"><span>' + esc(post['category']) + '</span></div>'
 
 
+def profile_image_url(user, kind):
+    stored = str(_post_value(user, kind) or '')
+    if not stored:
+        return ''
+    return '/perfil/imagem/' + str(_post_value(user, 'id')) + '/' + kind + '?v=' + urllib.parse.quote(stored, safe='')
+
+
 def content_card_html(post):
     date_value = post['published_at'] or post['created']
     return ('<article class="content-card">' +
@@ -1207,7 +1214,7 @@ def team_chat_html(c, user):
         mine = message['sender_id'] == user['id']
         side = 'client' if mine else 'office'
         message_time = esc(format_message_time(message['created']))
-        parts.append('<div class="message ' + side + ' team-message" data-avatar="' + esc(initials(message['sender_name'])) + '">' +
+        parts.append('<div class="message ' + side + ' team-message" data-align="' + ('mine' if mine else 'other') + '" data-avatar="' + esc(initials(message['sender_name'])) + '">' +
             '<span class="message-avatar" aria-hidden="true">' + esc(initials(message['sender_name'])) + '</span>' +
             '<div class="message-body"><p class="message-meta"><strong>' + esc(message['sender_name']) + '</strong></p>' +
             '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + attachment + '<span class="message-time">' + message_time + '</span></div></div></div>')
@@ -1237,7 +1244,8 @@ def guest_thread_html(session, messages, staff_view=False):
             sender = 'Equipe Bomfim & Lacerda'
             side = 'office'
         message_time = esc(format_message_time(message['created']))
-        parts.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
+        alignment = ('other' if staff_view else 'mine') if message['sender_role'] == 'guest' else ('mine' if staff_view else 'other')
+        parts.append('<div class="message ' + side + '" data-align="' + alignment + '" data-avatar="' + esc(initials(sender)) + '">' +
             '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
             '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong></p>' +
             '<div class="bubble"><p>' + esc(message['body']) + '</p><span class="message-time">' + message_time + '</span></div></div></div>')
@@ -1976,11 +1984,11 @@ class Handler(BaseHTTPRequestHandler):
         home = '/admin' if user['role'] == 'admin' else '/advogado'
         first_name = esc((user['name'] or '').split()[0] if user['name'] else '')
         role = role_label(user)
-        avatar = ('<img class="panel-avatar-img" src="/perfil/imagem/' + str(user['id']) + '/avatar" alt="">') if ('avatar' in user.keys() and user['avatar']) else esc(initials(user['name']))
+        avatar = ('<img class="panel-avatar-img" src="' + esc(profile_image_url(user, 'avatar')) + '" alt="">') if ('avatar' in user.keys() and user['avatar']) else esc(initials(user['name']))
         bell = self.notif_bell()
         nav = self.panel_nav(user)
         chat_alert = '<div class="staff-chat-alert" id="staff-chat-alert" data-chat-alert-endpoint="/admin/chats/alertas"><a class="staff-chat-bubble" id="staff-chat-bubble" href="/admin/chats" aria-label="Abrir chat da equipe" title="Chat da equipe"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg><span class="staff-chat-badge" id="staff-chat-badge" hidden>0</span></a><div class="staff-chat-toast" id="staff-chat-toast" hidden><button type="button" class="staff-chat-toast-close" id="staff-chat-toast-close" aria-label="Fechar aviso">×</button><p class="staff-chat-toast-meta">Nova mensagem no chat</p><strong id="staff-chat-toast-name"></strong><p id="staff-chat-toast-body"></p><a id="staff-chat-toast-link" href="/admin/chats">Abrir atendimento →</a></div></div>'
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261116a"><meta name="theme-color" content="#061d32"><link rel="manifest" href="/manifest.webmanifest"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261116a" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261116c"><meta name="theme-color" content="#061d32"><link rel="manifest" href="/manifest.webmanifest"></head><body class="panel-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">BOMFIM &amp; LACERDA</span><strong>{esc(title)}</strong></div><form class="panel-global-search" method="get" action="/admin/busca"><input type="search" name="q" placeholder="Buscar clientes, casos, tarefas, documentos..." aria-label="Busca global"></form><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'])}</strong><small>{esc(role)}</small></span></summary><div class="panel-user-dropdown"><a href="{home}">Meu painel</a><a href="/perfil">Meu perfil</a><a href="/senha">Alterar senha</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="{home}"><span class="panel-monogram">BL</span><span>BOMFIM &amp; LACERDA<small>ADVOCACIA</small></span></a>{nav}<div class="panel-side-card"><p class="eyebrow">ATENDIMENTO</p><strong>Conte com a nossa equipe.</strong><p>Estamos à disposição para apoiar o seu trabalho.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main">{content}</main></div>{chat_alert}<script src="/static/app.js?v=20261116c" defer></script></body></html>'''
 
     def chat_widget(self, user, csrf_token):
         with db() as c:
@@ -2007,7 +2015,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             nav += '<a class="nav-login" href="/entrar">Área do cliente</a>'
         widget = self.chat_widget(user, csrf_token) if not user or user['role'] == 'client' else ''
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261116a"><meta name="theme-color" content="#061d32"><link rel="manifest" href="/manifest.webmanifest"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261116a" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Bomfim & Lacerda Advocacia</title><link rel="stylesheet" href="/static/style.css?v=20261116c"><meta name="theme-color" content="#061d32"><link rel="manifest" href="/manifest.webmanifest"></head><body><a class="skip" href="#main">Pular para o conteúdo</a><header class="top"><a class="brand" href="/"><span class="monogram">BL</span><span>BOMFIM & LACERDA<small>ADVOCACIA</small></span></a><button class="mobile-toggle" type="button" id="menu-btn" aria-label="Abrir menu" aria-expanded="false" aria-controls="nav">☰</button><nav id="nav" aria-label="Navegação principal">{nav}</nav>{bell}</header><main id="main">{content}</main><footer><div><strong>BOMFIM & LACERDA</strong><p>40 anos de tradição jurídica.</p></div><div>Ética • Dedicação • Compromisso</div><div><a href="/privacidade">Privacidade</a> · <a href="/termos">Termos de uso</a></div></footer>{widget}<script src="/static/app.js?v=20261116c" defer></script></body></html>'''
 
     def client_layout(self, title, content, user=None, description=None, csrf_token=''):
         desc = description or (str(title) + ' — Meu Espaço — Bomfim & Lacerda Advocacia.')
@@ -2015,7 +2023,7 @@ class Handler(BaseHTTPRequestHandler):
         with db() as c:
             totals = conversation_unread_totals(c, user) if user else {'client': 0, 'internal': 0}
         unread = totals['client']
-        avatar = (('<img class="panel-avatar-img" src="/perfil/imagem/' + str(user['id']) + '/avatar" alt="">') if ('avatar' in user.keys() and user['avatar']) else esc(initials(user['name']))) if user else 'BL'
+        avatar = (('<img class="panel-avatar-img" src="' + esc(profile_image_url(user, 'avatar')) + '" alt="">') if ('avatar' in user.keys() and user['avatar']) else esc(initials(user['name']))) if user else 'BL'
         bell = self.notif_bell() if user else ''
         links = [('/cliente', 'Início', 'home'), ('/cliente/atendimentos', 'Meus atendimentos', 'cases'), ('/cliente/mensagens', 'Conversas', 'messages'), ('/cliente/documentos', 'Documentos', 'documents'), ('/cliente/compromissos', 'Compromissos', 'calendar'), ('/cliente/atualizacoes', 'Atualizações', 'updates'), ('/cliente/novo', 'Novo atendimento', 'add'), ('/perfil', 'Meu perfil', 'profile')]
         nav = []
@@ -2027,7 +2035,7 @@ class Handler(BaseHTTPRequestHandler):
             nav.append('<a href="' + href + '"' + (' class="active" aria-current="page"' if active else '') + '>' + panel_icon(icon) + '<span>' + esc(label) + '</span>' + badge + '</a>')
         nav = ''.join(nav)
         widget = self.chat_widget(user, csrf_token)
-        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261116a"><meta name="theme-color" content="#061d32"><link rel="manifest" href="/manifest.webmanifest"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261116a" defer></script></body></html>'''
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{esc(desc)}"><meta name="csrf-token" content="{esc(csrf_token)}"><title>{esc(title)} | Meu Espaço — Bomfim & Lacerda Advocacia</title><link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css?v=20261116c"><meta name="theme-color" content="#061d32"><link rel="manifest" href="/manifest.webmanifest"></head><body class="panel-area client-area"><a class="skip" href="#main">Pular para o conteúdo</a><header class="panel-top"><button type="button" class="panel-menu-btn" id="panel-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="panel-sidebar">☰</button><div class="panel-top-context"><span class="eyebrow">MEU ESPAÇO</span><strong>{esc(title)}</strong></div><div class="panel-top-actions">{bell}<details class="panel-user-menu"><summary aria-label="Menu da conta"><span class="panel-avatar">{avatar}</span><span class="panel-user-name"><strong>{esc(user['name'] if user else '')}</strong><small>Cliente</small></span></summary><div class="panel-user-dropdown"><a href="/cliente">Meu painel</a><a href="/cliente/perfil">Meu perfil</a><a href="/">Site do escritório</a><a href="/sair">Sair</a></div></details><a class="panel-exit" href="/sair" aria-label="Sair">Sair</a></div></header><div class="panel-shell"><aside class="panel-sidebar" id="panel-sidebar"><a class="panel-brand" href="/cliente"><span class="panel-monogram">BL</span><span>MEU ESPAÇO<small>BOMFIM &amp; LACERDA</small></span></a><nav class="panel-nav" id="nav" aria-label="Menu do cliente">{nav}</nav><div class="panel-side-card"><p class="eyebrow">SUPORTE</p><strong>Estamos à disposição.</strong><p>Fale com a equipe do escritório sempre que precisar.</p><a class="text-link" href="/contato">Falar com o escritório →</a></div></aside><button type="button" class="panel-overlay" id="panel-overlay" aria-label="Fechar menu" tabindex="-1"></button><main id="main" class="panel-main client-main">{content}</main></div>{widget}<script src="/static/app.js?v=20261116c" defer></script></body></html>'''
 
     def page(self, title, content, user=None, status=200, description=None):
         data = self.session()
@@ -2237,7 +2245,7 @@ class Handler(BaseHTTPRequestHandler):
                 meta_case = conversation_meta['case_id'] if conversation_meta else ''
                 meta_client = conversation_meta['client_id'] if conversation_meta else ''
                 task_button = '<div class="message-tools"><button type="button" class="task-from-message" data-task-from-message="' + str(message['id']) + '" data-task-case="' + str(meta_case or '') + '" data-task-client="' + str(meta_client or '') + '" data-task-body="' + esc(message['body'][:200]) + '">' + panel_icon('tasks') + 'Criar tarefa a partir desta mensagem</button></div>'
-            messages_html.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
+            messages_html.append('<div class="message ' + side + '" data-align="' + ('mine' if mine else 'other') + '" data-avatar="' + esc(initials(sender)) + '">' +
                 '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
                 '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong>' + unread_mark + '</p>' +
                 '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '<span class="message-time">' + message_time + '</span></div>' + task_button + '</div></div>')
@@ -2870,7 +2878,8 @@ class Handler(BaseHTTPRequestHandler):
                 if day_label != last_day:
                     messages_html.append(format_message_day_separator(message['created']))
                     last_day = day_label
-                if message['sender_id'] == user['id']:
+                mine = message['sender_id'] == user['id']
+                if mine:
                     sender = 'Você'
                 elif user['role'] == 'client' and message['sender_role'] != 'client' and not message['reveal_identity']:
                     sender = 'Suporte do escritório'
@@ -2885,7 +2894,7 @@ class Handler(BaseHTTPRequestHandler):
                     side = 'client'
                 unread_mark = '<span class="unread-mark" title="Não lida pela equipe"></span>' if not message['read_by_staff'] and user['role'] != 'client' and message['sender_id'] != user['id'] else ''
                 message_time = esc(format_message_time(message['created']))
-                messages_html.append('<div class="message ' + side + '" data-avatar="' + esc(initials(sender)) + '">' +
+                messages_html.append('<div class="message ' + side + '" data-align="' + ('mine' if mine else 'other') + '" data-avatar="' + esc(initials(sender)) + '">' +
                     '<span class="message-avatar" aria-hidden="true">' + esc(initials(sender)) + '</span>' +
                     '<div class="message-body"><p class="message-meta"><strong>' + esc(sender) + '</strong>' + unread_mark + '</p>' +
                     '<div class="bubble"><p>' + highlight_mentions(message['body']) + '</p>' + file_links + '<span class="message-time">' + message_time + '</span></div>' +
@@ -2917,8 +2926,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/perfil':
             if not user:
                 return self.forbidden()
-            avatar_preview = '<img class="profile-avatar-preview" src="/perfil/imagem/' + str(user['id']) + '/avatar" alt="Foto de perfil">' if user['avatar'] else '<span class="profile-avatar-preview profile-avatar-fallback">' + esc(initials(user['name'])) + '</span>'
-            cover_preview = '<img class="profile-cover-preview" src="/perfil/imagem/' + str(user['id']) + '/cover" alt="Capa do perfil">' if user['cover'] else '<div class="profile-cover-preview profile-cover-fallback"></div>'
+            avatar_preview = '<img class="profile-avatar-preview" src="' + esc(profile_image_url(user, 'avatar')) + '" alt="Foto de perfil">' if user['avatar'] else '<span class="profile-avatar-preview profile-avatar-fallback">' + esc(initials(user['name'])) + '</span>'
+            cover_preview = '<img class="profile-cover-preview" src="' + esc(profile_image_url(user, 'cover')) + '" alt="Capa do perfil">' if user['cover'] else '<div class="profile-cover-preview profile-cover-fallback"></div>'
             profile_form = form('/perfil', input_field('Nome', 'name', user['name']) + input_field('Telefone', 'phone', user['phone'], required=False) + '<label>Foto de perfil<input type="file" name="avatar" accept="image/png,image/jpeg,image/webp"></label><label>Capa<input type="file" name="cover" accept="image/png,image/jpeg,image/webp"></label><label class="check"><input type="checkbox" name="remove_avatar" value="1"> Restaurar foto padrão institucional</label><label class="check"><input type="checkbox" name="remove_cover" value="1"> Restaurar capa padrão institucional</label>', 'Salvar perfil', 'multipart/form-data')
             content = '<section class="client-home"><div class="profile-cover-wrap">' + cover_preview + '</div><div class="profile-heading">' + avatar_preview + '<div><p class="eyebrow">MEU PERFIL</p><h1>' + esc(user['name']) + '</h1><p class="muted">' + esc(role_label(user)) + ' · ' + esc(user['email']) + '</p></div></div>' + card('Dados e imagens', profile_form) + '<p><a class="text-link" href="/senha">Alterar senha</a></p></section>'
             return self.page('Meu perfil', content, user)
@@ -2940,7 +2949,7 @@ class Handler(BaseHTTPRequestHandler):
             file_path = UP / stored
             if not file_path.is_file():
                 return self.send('Não encontrado', 404)
-            return self.send_file(file_path, mimetypes.guess_type(stored)[0] or 'application/octet-stream', cache='private, max-age=3600')
+            return self.send_file(file_path, mimetypes.guess_type(stored)[0] or 'application/octet-stream', cache='private, no-store')
         if path.startswith('/cliente/atendimento/'):
             if not user or user['role'] != 'client':
                 return self.forbidden()
