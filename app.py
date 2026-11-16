@@ -163,7 +163,7 @@ def migrate_appointments_nullable(c):
     c.execute('CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status,when_at)')
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 
 def schema_version():
@@ -227,7 +227,7 @@ CREATE TABLE IF NOT EXISTS appointment_participants(id INTEGER PRIMARY KEY,appoi
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),subject TEXT NOT NULL,body TEXT NOT NULL,response TEXT DEFAULT '',status TEXT DEFAULT 'Pendente',responded_by INTEGER REFERENCES users(id),responded_at TEXT DEFAULT '',last_activity_at TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),filename TEXT NOT NULL,stored TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL,source TEXT NOT NULL,uploaded_by INTEGER REFERENCES users(id),reviewed INTEGER NOT NULL DEFAULT 0,seen_by_client INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'aguardando_analise',analysis_notes TEXT DEFAULT '',reviewed_by INTEGER REFERENCES users(id),reviewed_at TEXT DEFAULT '',deleted_at TEXT DEFAULT '',deleted_by INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES users(id),case_id INTEGER REFERENCES cases(id),sender_id INTEGER REFERENCES users(id),sender_role TEXT NOT NULL,visibility TEXT NOT NULL DEFAULT 'client',reveal_identity INTEGER NOT NULL DEFAULT 0,body TEXT NOT NULL,read_by_client INTEGER NOT NULL DEFAULT 0,read_by_staff INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,title TEXT NOT NULL,slug TEXT DEFAULT '',summary TEXT DEFAULT '',category TEXT NOT NULL,body TEXT NOT NULL,cover_image TEXT DEFAULT '',cover_position TEXT DEFAULT '50% 30%',cover_fit TEXT DEFAULT 'cover',author TEXT DEFAULT '',sources TEXT DEFAULT '',published INTEGER NOT NULL DEFAULT 0,published_at TEXT DEFAULT '',updated_at TEXT DEFAULT '',featured INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY,title TEXT NOT NULL,slug TEXT DEFAULT '',summary TEXT DEFAULT '',category TEXT NOT NULL,body TEXT NOT NULL,cover_image TEXT DEFAULT '',cover_mime TEXT DEFAULT '',cover_data TEXT DEFAULT '',cover_position TEXT DEFAULT '50% 30%',cover_fit TEXT DEFAULT 'cover',author TEXT DEFAULT '',sources TEXT DEFAULT '',published INTEGER NOT NULL DEFAULT 0,published_at TEXT DEFAULT '',updated_at TEXT DEFAULT '',featured INTEGER NOT NULL DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS faqs(id INTEGER PRIMARY KEY,question TEXT NOT NULL,answer TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 0,category TEXT DEFAULT 'Geral',sort_order INTEGER NOT NULL DEFAULT 0,updated TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL,message TEXT NOT NULL,ip TEXT DEFAULT '',consent INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'novo',responsible_id INTEGER REFERENCES users(id) ON DELETE SET NULL,updated TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,user_id INTEGER,action TEXT NOT NULL,detail TEXT NOT NULL,ip TEXT DEFAULT '',user_agent TEXT DEFAULT '',entity TEXT DEFAULT '',entity_id INTEGER,client_id INTEGER,case_id INTEGER,before TEXT DEFAULT '',after TEXT DEFAULT '',created TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -343,6 +343,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user
         ensure_column(c, 'posts', 'cover_image', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'cover_position', "TEXT DEFAULT '50% 30%'")
         ensure_column(c, 'posts', 'cover_fit', "TEXT DEFAULT 'cover'")
+        ensure_column(c, 'posts', 'cover_mime', "TEXT DEFAULT ''")
+        ensure_column(c, 'posts', 'cover_data', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'author', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'sources', "TEXT DEFAULT ''")
         ensure_column(c, 'posts', 'published_at', "TEXT DEFAULT ''")
@@ -1487,13 +1489,14 @@ def post_form(post=None, action='/admin/post'):
             '</form>')
 
 
-def save_post_cover(files, old=''):
+def save_post_cover(files, existing=None):
+    existing = dict(existing) if existing else {}
     info = files.get('cover') if files else None
     if not info:
-        return old
+        return existing.get('cover_image', ''), existing.get('cover_mime', ''), existing.get('cover_data', '')
     filename, payload, _mime = info
     if not payload:
-        return old
+        return existing.get('cover_image', ''), existing.get('cover_mime', ''), existing.get('cover_data', '')
     allowed = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp'}
     extension = Path(filename or '').suffix.lower()
     if extension not in allowed or len(payload) > MAX_FILE:
@@ -1508,7 +1511,7 @@ def save_post_cover(files, old=''):
         temp.unlink(missing_ok=True)
         raise ValidationError('A imagem de capa não passou na verificação de segurança.')
     os.replace(temp, UP / stored)
-    return stored
+    return stored, allowed[extension], base64.b64encode(payload).decode('ascii')
 
 
 def post_payload(fields, files, existing=None):
@@ -1547,12 +1550,13 @@ def post_payload(fields, files, existing=None):
         published_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
     cover_position = safe_cover_position(fields.get('cover_position', existing.get('cover_position', '50% 30%')))
     cover_fit = 'contain' if fields.get('cover_fit') == 'contain' else 'cover'
+    cover_image, cover_mime, cover_data = save_post_cover(files, existing)
     return {
         'title': title, 'category': category, 'summary': summary, 'body': body,
         'author': author, 'sources': sources, 'published_at': published_at,
         'published': 1 if action == 'publish' else 0,
         'featured': 1 if fields.get('featured') == '1' else 0,
-        'cover_image': save_post_cover(files, existing.get('cover_image', '')),
+        'cover_image': cover_image, 'cover_mime': cover_mime, 'cover_data': cover_data,
         'cover_position': cover_position, 'cover_fit': cover_fit,
         'updated_at': updated_at,
         'action': action,
@@ -2711,11 +2715,18 @@ class Handler(BaseHTTPRequestHandler):
         if re.fullmatch(r'/conteudo/capa/\d+', path):
             post_id = int(path.rsplit('/', 1)[-1])
             with db() as c:
-                post = c.execute('SELECT cover_image FROM posts WHERE id=?', (post_id,)).fetchone()
-            if not post or not post['cover_image']:
+                post = c.execute('SELECT cover_image,cover_mime,cover_data FROM posts WHERE id=?', (post_id,)).fetchone()
+            if not post:
                 return self.send('Imagem n?o encontrada', 404)
-            target = UP / post['cover_image']
-            if not target.is_file():
+            if post['cover_data']:
+                try:
+                    payload = base64.b64decode(post['cover_data'])
+                except Exception:
+                    payload = b''
+                if payload:
+                    return self.send(payload, ctype=post['cover_mime'] or 'image/png', cache='public, max-age=86400')
+            target = UP / str(post['cover_image'] or '')
+            if not post['cover_image'] or not target.is_file():
                 return self.send('Imagem n?o encontrada', 404)
             ctype = mimetypes.guess_type(str(target))[0] or 'application/octet-stream'
             return self.send_file(target, ctype, cache='public, max-age=86400')
@@ -5886,11 +5897,11 @@ class Handler(BaseHTTPRequestHandler):
                     with db() as c:
                         if path == '/admin/post':
                             slug = post_slug(c, payload['title'])
-                            cursor = c.execute('INSERT INTO posts(title,slug,summary,category,body,cover_image,cover_position,cover_fit,author,sources,published,published_at,updated_at,featured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['cover_position'], payload['cover_fit'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured']))
+                            cursor = c.execute('INSERT INTO posts(title,slug,summary,category,body,cover_image,cover_mime,cover_data,cover_position,cover_fit,author,sources,published,published_at,updated_at,featured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['cover_mime'], payload['cover_data'], payload['cover_position'], payload['cover_fit'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured']))
                             self.audit_action(c, user['id'], 'criar conteúdo', payload['title'], entity='post', entity_id=cursor.lastrowid, after={'title': payload['title'], 'category': payload['category'], 'published': payload['published'], 'published_at': payload['published_at'], 'featured': payload['featured']})
                         else:
                             slug = post_slug(c, payload['title'], post_id)
-                            c.execute('UPDATE posts SET title=?,slug=?,summary=?,category=?,body=?,cover_image=?,cover_position=?,cover_fit=?,author=?,sources=?,published=?,published_at=?,updated_at=?,featured=? WHERE id=?', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['cover_position'], payload['cover_fit'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured'], post_id))
+                            c.execute('UPDATE posts SET title=?,slug=?,summary=?,category=?,body=?,cover_image=?,cover_mime=?,cover_data=?,cover_position=?,cover_fit=?,author=?,sources=?,published=?,published_at=?,updated_at=?,featured=? WHERE id=?', (payload['title'], slug, payload['summary'], payload['category'], payload['body'], payload['cover_image'], payload['cover_mime'], payload['cover_data'], payload['cover_position'], payload['cover_fit'], payload['author'], payload['sources'], payload['published'], payload['published_at'], payload['updated_at'], payload['featured'], post_id))
                             self.audit_action(c, user['id'], 'editar conteúdo', payload['title'], entity='post', entity_id=post_id, before={'title': existing['title'], 'category': existing['category'], 'published': existing['published'], 'published_at': existing['published_at'], 'featured': existing['featured']}, after={'title': payload['title'], 'category': payload['category'], 'published': payload['published'], 'published_at': payload['published_at'], 'featured': payload['featured']})
                     redirect_to = '/admin/conteudos'
                 elif path == '/admin/conteudos/status':
