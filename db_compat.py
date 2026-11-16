@@ -74,7 +74,14 @@ class CompatCursor:
         append_returning = bool(table_match and table_match.group(1).lower() not in _NO_ID_TABLES and not has_returning)
         if append_returning:
             translated = translated.rstrip().rstrip(';') + ' RETURNING id'
-        self._cursor.execute(translated, params or ())
+        if params:
+            # psycopg usa % como marcador; % literais precisam ser escapados.
+            translated = re.sub(r'%(?![s%])', '%%', translated)
+            self._cursor.execute(translated, params)
+        else:
+            # Sem par?metros, n?o passar uma tupla vazia: ela faria o psycopg
+            # interpretar % literais de DDL/consultas como placeholders.
+            self._cursor.execute(translated)
         self.lastrowid = 0
         if append_returning:
             row = self._cursor.fetchone()
