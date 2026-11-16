@@ -116,8 +116,11 @@ class CompatConnection:
         text = str(sql)
         if not IS_POSTGRES:
             return text
+        if re.fullmatch(r'\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)\s*;?\s*', text, re.I):
+            return 'SELECT 1'
         original = text
         text = re.sub(r'\bGROUP_CONCAT\s*\(', 'STRING_AGG(', text, flags=re.I)
+        text = re.sub(r'\bIS\s+\?', 'IS NOT DISTINCT FROM ?', text, flags=re.I)
         ignore = bool(re.search(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', text, re.I))
         text = re.sub(r'\bINSERT\s+OR\s+IGNORE\s+INTO\b', 'INSERT INTO', text, flags=re.I)
         if ignore and not re.search(r'\bON\s+CONFLICT\b', text, re.I):

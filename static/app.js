@@ -300,7 +300,44 @@ if (notifWrap) {
       day: '2-digit', month: '2-digit', year: 'numeric',
       hour: '2-digit', minute: '2-digit', hour12: false,
     }).format(parsed).replace(',', ' às');
+  }
+
+  const updateAppBadge = (unread) => {
+    try {
+      if (!('setAppBadge' in navigator)) return;
+      if (unread > 0) navigator.setAppBadge(unread);
+      else if ('clearAppBadge' in navigator) navigator.clearAppBadge();
+    } catch (error) { /* badge indispon?vel */ }
   };
+
+  const showBrowserNotice = async (item) => {
+    const title = item.title || 'Bomfim & Lacerda Advocacia';
+    const options = {
+      body: item.body || '',
+      icon: '/static/img/icon-192.png',
+      badge: '/static/img/icon-192.png',
+      tag: 'bl-notification-' + item.id,
+      data: { url: typeof item.url === 'string' && item.url.startsWith('/') ? item.url : '/admin' },
+    };
+    try {
+      if ('serviceWorker' in navigator) {
+        const registration = await navigator.serviceWorker.getRegistration();
+        if (registration && registration.showNotification) {
+          await registration.showNotification(title, options);
+          return;
+        }
+      }
+    } catch (error) { /* usa Notification abaixo */ }
+    try {
+      const notice = new Notification(title, options);
+      notice.onclick = () => {
+        window.focus();
+        if (options.data.url) window.location.href = options.data.url;
+        notice.close();
+      };
+    } catch (error) { /* notifica??o indispon?vel */ }
+  };
+;
 
   const renderList = () => {
     const activeId = document.activeElement && document.activeElement.dataset.notificationId;
@@ -437,6 +474,7 @@ if (notifWrap) {
     updateConversationCounters(data);
     notifCount.textContent = unread > 99 ? '99+' : String(unread);
     notifCount.hidden = unread === 0;
+    updateAppBadge(unread);
     notifButton.setAttribute('aria-label', unread ? `Notificações: ${unread} não lida${unread === 1 ? '' : 's'}` : 'Notificações: nenhuma não lida');
     notifSummary.textContent = unread ? `${unread} aviso${unread === 1 ? '' : 's'} não lido${unread === 1 ? '' : 's'}` : 'Tudo em dia';
     notifReadAll.disabled = unread === 0;
@@ -446,18 +484,7 @@ if (notifWrap) {
     if (newItems.length) startTitleAlert(unread);
     else if (unread === 0) stopTitleAlert();
     if (browserNotificationsEnabled() && 'Notification' in window && Notification.permission === 'granted') {
-      newItems.slice(0, 3).forEach((item) => {
-        try {
-          const browserNotice = new Notification(item.title, { body: item.body || '', tag: 'bl-notification-' + item.id });
-          browserNotice.onclick = () => {
-            window.focus();
-            if (typeof item.url === 'string' && item.url.startsWith('/')) window.location.href = item.url;
-            browserNotice.close();
-          };
-        } catch (error) {
-          /* ignore */
-        }
-      });
+      newItems.slice(0, 3).forEach((item) => { showBrowserNotice(item); });
     }
     items.forEach((item) => seenIds.add(item.id));
     firstLoad = false;
@@ -1192,3 +1219,9 @@ document.querySelectorAll('[data-cover-editor]').forEach((editor) => {
     });
   }
 });
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
